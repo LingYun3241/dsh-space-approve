@@ -138,6 +138,22 @@ window.__ModuleLoader__.load({
     };
 
     function createHandler({ uiSession, escapeEnabled }) {
+      /** Diagnostics kept on `window.__dshSpaceApprove` for DevTools inspection. */
+      const diagnostics = (() => {
+        const existing = window.__dshSpaceApprove;
+        if (existing && Array.isArray(existing.inputs)) return existing;
+        const fresh = { inputs: [], decisions: [] };
+        window.__dshSpaceApprove = fresh;
+        return fresh;
+      })();
+      const record = (bucket, entry) => {
+        try {
+          bucket.push({ t: Date.now(), ...entry });
+          if (bucket.length > 20) bucket.splice(0, bucket.length - 20);
+        } catch {
+          /* diagnostics must never break the handler */
+        }
+      };
       /**
        * Resolve the single pending, visible approval request.
        * `null` means "do not act" (nothing pending, stale DOM, hidden panel, or
@@ -188,6 +204,19 @@ window.__ModuleLoader__.load({
       const onFixedInput = (input) => {
         try {
           if (!input || input.type !== "keydown") return;
+          const gesture0 = input.gesture;
+          const context0 = input.context;
+          if (gesture0 && (gesture0.code === "Space" || gesture0.code === "Escape" || gesture0.code === "Enter")) {
+            record(diagnostics.inputs, {
+              via: "shortcuts",
+              code: gesture0.code,
+              composing: Boolean(gesture0.composing),
+              repeat: Boolean(gesture0.repeat),
+              prevented: Boolean(gesture0.defaultPrevented),
+              region: context0 && context0.region,
+              modal: context0 && context0.modal,
+            });
+          }
           if (!escapeEnabled && input.gesture && input.gesture.code === "Escape") return;
           const action = actionOf(input.gesture);
           if (action === null) return;
@@ -198,7 +227,9 @@ window.__ModuleLoader__.load({
           if (context && context.region !== "page") return;
           if (context && context.modal !== null && context.modal !== undefined) return;
           if (editingSomewhere()) return;
-          if (!run(action, activatableInsideCard)) return;
+          const acted = run(action, activatableInsideCard);
+          record(diagnostics.decisions, { via: "shortcuts", action, acted });
+          if (!acted) return;
           if (typeof input.consume === "function") input.consume();
         } catch (error) {
           log("fixed input handler failed", error);
@@ -208,13 +239,26 @@ window.__ModuleLoader__.load({
       /** Fallback path: raw document keydown, same business rules. */
       const onDomKeyDown = (event) => {
         try {
+          if (event && (event.code === "Space" || event.code === "Escape" || event.code === "Enter")) {
+            record(diagnostics.inputs, {
+              via: "dom",
+              code: event.code,
+              key: event.key,
+              composing: Boolean(event.isComposing),
+              keyCode: event.keyCode,
+              repeat: Boolean(event.repeat),
+              prevented: Boolean(event.defaultPrevented),
+            });
+          }
           if (!event || event.defaultPrevented || event.repeat || event.isComposing || event.keyCode === 229) return;
           const action = actionOfDom(event);
           if (action === null) return;
           if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
           if (!isElement(event.target)) return;
           if (isEditable(event.target) || editingSomewhere()) return;
-          if (!run(action, focusedInsideCard)) return;
+          const acted = run(action, focusedInsideCard);
+          record(diagnostics.decisions, { via: "dom", action, acted });
+          if (!acted) return;
           event.preventDefault();
           if (typeof event.stopPropagation === "function") event.stopPropagation();
         } catch (error) {
