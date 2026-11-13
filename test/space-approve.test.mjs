@@ -1,9 +1,10 @@
 /**
  * Offline test harness for dsh-space-approve.
  *
- * Loads the REAL client.js in a vm sandbox with a purpose-built mini-DOM
- * (jsdom is not installed), publishes fake pending interactions through a fake
- * `uiSession`, and dispatches real keydown objects. No DSH instance required.
+ * Loads the REAL client.js in a vm sandbox with a purpose-built mini-DOM, fakes
+ * the `uiSession` and `shortcuts` services, and drives both input paths:
+ *   A) the official `observeFixedInput` path (normalized gesture + context)
+ *   B) the document-keydown fallback used when that service is unavailable
  *
  * Run:  node test/space-approve.test.mjs
  */
@@ -228,7 +229,54 @@ function makeUiSession(pendingList) {
   };
 }
 
-function loadPlugin(window, uiSession) {
+/** Fake of the official shortcuts service: keep listeners, replay fixed input like the host does. */
+function makeShortcuts() {
+  const listeners = new Set();
+  return {
+    listeners,
+    observeFixedInput(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    /** Mirrors `fixedInput()`: later listeners see `defaultPrevented` once someone consumes. */
+    emit(input) {
+      let consumed = false;
+      for (const listener of [...listeners]) {
+        if (!listeners.has(listener)) continue;
+        listener({
+          ...input,
+          gesture: { ...input.gesture, defaultPrevented: input.gesture.defaultPrevented || consumed },
+          consume: () => {
+            consumed = true;
+            if (typeof input.consume === "function") input.consume();
+          },
+        });
+      }
+      return consumed;
+    },
+  };
+}
+
+function fixedInput({ code = "Space", region = "page", modal = null, target = null, ...rest } = {}) {
+  const input = {
+    type: "keydown",
+    gesture: {
+      code,
+      control: Boolean(rest.control),
+      alt: Boolean(rest.alt),
+      shift: Boolean(rest.shift),
+      meta: Boolean(rest.meta),
+      repeat: Boolean(rest.repeat),
+      composing: Boolean(rest.composing),
+      defaultPrevented: Boolean(rest.defaultPrevented),
+    },
+    context: { region, modal, target },
+    consume: () => {},
+  };
+  return input;
+}
+
+function loadPlugin(window, { uiSession, shortcuts, config } = {}) {
   const doc = window.document;
   const out = { window, doc, exports: null, error: null, dispose: null };
   window.__ModuleLoader__ = {
@@ -260,13 +308,16 @@ function loadPlugin(window, uiSession) {
   }
   if (out.exports && typeof out.exports.apply === "function") {
     try {
-      out.exports.apply({
-        get: (name) => (name === "uiSession" ? uiSession : undefined),
-        effect: (fn) => {
-          out.dispose = fn();
-          return out.dispose;
+      out.exports.apply(
+        {
+          get: (name) => (name === "uiSession" ? uiSession : name === "shortcuts" ? shortcuts : undefined),
+          effect: (fn) => {
+            out.dispose = fn();
+            return out.dispose;
+          },
         },
-      });
+        config,
+      );
     } catch (error) {
       out.error = error;
     }
@@ -274,21 +325,20 @@ function loadPlugin(window, uiSession) {
   return out;
 }
 
-function press(loaded, options = {}) {
+function pressDom(loaded, { key = " ", code = "Space", target, defaultPrevented = false, ...rest } = {}) {
   const doc = loaded.doc;
-  const target = options.target || doc.activeElement || doc.body;
   const event = {
-    key: options.key ?? " ",
-    code: options.code ?? "Space",
-    target,
-    defaultPrevented: false,
-    repeat: Boolean(options.repeat),
-    isComposing: Boolean(options.isComposing),
-    keyCode: options.keyCode || 0,
-    ctrlKey: Boolean(options.ctrlKey),
-    metaKey: Boolean(options.metaKey),
-    altKey: Boolean(options.altKey),
-    shiftKey: Boolean(options.shiftKey),
+    key,
+    code,
+    target: target || doc.activeElement || doc.body,
+    defaultPrevented,
+    repeat: Boolean(rest.repeat),
+    isComposing: Boolean(rest.isComposing),
+    keyCode: rest.keyCode || 0,
+    ctrlKey: Boolean(rest.ctrlKey),
+    metaKey: Boolean(rest.metaKey),
+    altKey: Boolean(rest.altKey),
+    shiftKey: Boolean(rest.shiftKey),
     preventDefault() {
       this.defaultPrevented = true;
     },
@@ -307,133 +357,147 @@ function check(name, condition, detail = "") {
   console.log(`${condition ? "PASS" : "FAIL"}  ${name}${detail ? "   [" + detail + "]" : ""}`);
 }
 
-console.log("=".repeat(78));
-console.log("dsh-space-approve — safety and behaviour checks");
-console.log("=".repeat(78));
-
-/* 1. Happy path: visible panel + matching pending request. */
-{
-  const window = makeWindow();
-  const panel = buildApprovalPanel(window.document);
+function outcomesOf(pending) {
+  return pending.__outcomes;
+}
+function trackedPending(key, options = {}) {
   const outcomes = [];
-  const pending = makePending("approval:1", { outcomeLog: outcomes });
-  const loaded = loadPlugin(window, makeUiSession([pending]));
-  check("1 bundle loads and applies without error", loaded.exports && !loaded.error, loaded.error ? String(loaded.error) : "");
-  const event = press(loaded);
-  check("1 Space answers the pending request exactly once", JSON.stringify(outcomes) === '["allowed-once"]', JSON.stringify(outcomes));
-  check("1 Space is consumed (no page scroll)", event.defaultPrevented === true);
-  check("1 no button is clicked (semantic answer, not a positional click)", panel.buttons.every((button) => button.__clicks === 0));
+  const pending = makePending(key, { ...options, outcomeLog: outcomes });
+  pending.__outcomes = outcomes;
+  return pending;
 }
 
-/* 2. No pending request: a stale panel must not be answerable. */
+console.log("=".repeat(78));
+console.log("A. official shortcuts path (observeFixedInput)");
+console.log("=".repeat(78));
+
+/* A1 — registration */
+{
+  const window = makeWindow();
+  buildApprovalPanel(window.document);
+  const shortcuts = makeShortcuts();
+  const pending = trackedPending("approval:1");
+  const loaded = loadPlugin(window, { uiSession: makeUiSession([pending]), shortcuts });
+  check("A1 bundle applies without error", loaded.exports && !loaded.error, loaded.error ? String(loaded.error) : "");
+  check("A1 subscribes exactly one fixed-input listener", shortcuts.listeners.size === 1, `size=${shortcuts.listeners.size}`);
+}
+
+/* A2 — Space approves once */
 {
   const window = makeWindow();
   const panel = buildApprovalPanel(window.document);
-  const loaded = loadPlugin(window, makeUiSession([]));
-  const event = press(loaded);
-  check("2 stale panel with no pending request is ignored", event.defaultPrevented === false && panel.buttons.every((b) => b.__clicks === 0));
+  const shortcuts = makeShortcuts();
+  const pending = trackedPending("approval:1");
+  loadPlugin(window, { uiSession: makeUiSession([pending]), shortcuts });
+  const consumed = shortcuts.emit(fixedInput());
+  check("A2 Space answers allowed-once exactly once", JSON.stringify(outcomesOf(pending)) === '["allowed-once"]', JSON.stringify(outcomesOf(pending)));
+  check("A2 Space is consumed", consumed === true);
+  check("A2 no button clicked", panel.buttons.every((button) => button.__clicks === 0));
 }
 
-/* 3. Typing in a textarea keeps Space native. */
+/* A3 — editable region is typing */
 {
   const window = makeWindow();
-  const panel = buildApprovalPanel(window.document);
+  buildApprovalPanel(window.document);
+  const shortcuts = makeShortcuts();
+  const pending = trackedPending("approval:1");
+  loadPlugin(window, { uiSession: makeUiSession([pending]), shortcuts });
+  const consumed = shortcuts.emit(fixedInput({ region: "editable" }));
+  check("A3 editable region passes through", consumed === false && outcomesOf(pending).length === 0);
+}
+
+/* A4 — IME composition */
+{
+  const window = makeWindow();
+  buildApprovalPanel(window.document);
+  const shortcuts = makeShortcuts();
+  const pending = trackedPending("approval:1");
+  loadPlugin(window, { uiSession: makeUiSession([pending]), shortcuts });
+  const consumed = shortcuts.emit(fixedInput({ composing: true }));
+  check("A4 composing Space never approves", consumed === false && outcomesOf(pending).length === 0);
+}
+
+/* A5 — key repeat */
+{
+  const window = makeWindow();
+  buildApprovalPanel(window.document);
+  const shortcuts = makeShortcuts();
+  const pending = trackedPending("approval:1");
+  loadPlugin(window, { uiSession: makeUiSession([pending]), shortcuts });
+  const consumed = shortcuts.emit(fixedInput({ repeat: true }));
+  check("A5 held Space never re-fires", consumed === false && outcomesOf(pending).length === 0);
+}
+
+/* A6 — chorded Space */
+{
+  const window = makeWindow();
+  buildApprovalPanel(window.document);
+  const shortcuts = makeShortcuts();
+  const pending = trackedPending("approval:1");
+  loadPlugin(window, { uiSession: makeUiSession([pending]), shortcuts });
+  const consumed = shortcuts.emit(fixedInput({ control: true }));
+  check("A6 Ctrl+Space is left alone", consumed === false && outcomesOf(pending).length === 0);
+}
+
+/* A7 — Escape rejects */
+{
+  const window = makeWindow();
+  buildApprovalPanel(window.document);
+  const shortcuts = makeShortcuts();
+  const pending = trackedPending("approval:1");
+  loadPlugin(window, { uiSession: makeUiSession([pending]), shortcuts });
+  const consumed = shortcuts.emit(fixedInput({ code: "Escape" }));
+  check("A7 Escape answers rejected", JSON.stringify(outcomesOf(pending)) === '["rejected"]', JSON.stringify(outcomesOf(pending)));
+  check("A7 Escape is consumed", consumed === true);
+}
+
+/* A8 — Escape can be disabled by config */
+{
+  const window = makeWindow();
+  buildApprovalPanel(window.document);
+  const shortcuts = makeShortcuts();
+  const pending = trackedPending("approval:1");
+  loadPlugin(window, { uiSession: makeUiSession([pending]), shortcuts, config: { escape: false } });
+  const consumed = shortcuts.emit(fixedInput({ code: "Escape" }));
+  check("A8 config { escape: false } disables Escape", consumed === false && outcomesOf(pending).length === 0);
+  const spaceConsumed = shortcuts.emit(fixedInput());
+  check("A8 Space still works when Escape is disabled", spaceConsumed === true && JSON.stringify(outcomesOf(pending)) === '["allowed-once"]');
+}
+
+/* A9 — unrelated modal */
+{
+  const window = makeWindow();
+  buildApprovalPanel(window.document);
+  const shortcuts = makeShortcuts();
+  const pending = trackedPending("approval:1");
+  loadPlugin(window, { uiSession: makeUiSession([pending]), shortcuts });
+  const consumed = shortcuts.emit(fixedInput({ modal: "other" }));
+  check("A9 an unrelated modal suppresses approval", consumed === false && outcomesOf(pending).length === 0);
+}
+
+/* A10 — focus still in an editor */
+{
+  const window = makeWindow();
+  buildApprovalPanel(window.document);
   const textarea = new Element("textarea", window.document);
   window.document.body.appendChild(textarea);
   textarea.focus();
-  const outcomes = [];
-  const pending = makePending("approval:1", { outcomeLog: outcomes });
-  const loaded = loadPlugin(window, makeUiSession([pending]));
-  const event = press(loaded, { target: textarea });
-  check("3 Space typed in a textarea is not intercepted", event.defaultPrevented === false && outcomes.length === 0);
-  check("3 all decision buttons untouched", panel.buttons.every((b) => b.__clicks === 0));
+  const shortcuts = makeShortcuts();
+  const pending = trackedPending("approval:1");
+  loadPlugin(window, { uiSession: makeUiSession([pending]), shortcuts });
+  const consumed = shortcuts.emit(fixedInput());
+  check("A10 focus in a textarea blocks approval", consumed === false && outcomesOf(pending).length === 0);
 }
 
-/* 4. Focus in an editor while the event targets <body>. */
-{
-  const window = makeWindow();
-  buildApprovalPanel(window.document);
-  const textarea = new Element("textarea", window.document);
-  window.document.body.appendChild(textarea);
-  textarea.focus();
-  const outcomes = [];
-  const pending = makePending("approval:1", { outcomeLog: outcomes });
-  const loaded = loadPlugin(window, makeUiSession([pending]));
-  const event = press(loaded, { target: window.document.body });
-  check("4 Space with focus still in an editor is not intercepted", event.defaultPrevented === false && outcomes.length === 0);
-}
-
-/* 5. Focus on a button outside the panel keeps native activation. */
-{
-  const window = makeWindow();
-  buildApprovalPanel(window.document);
-  const sidebarButton = new Element("button", window.document);
-  window.document.body.appendChild(sidebarButton);
-  sidebarButton.focus();
-  const outcomes = [];
-  const pending = makePending("approval:1", { outcomeLog: outcomes });
-  const loaded = loadPlugin(window, makeUiSession([pending]));
-  const event = press(loaded, { target: sidebarButton });
-  check("5 Space on a focused unrelated button is left to the browser", event.defaultPrevented === false && outcomes.length === 0);
-}
-
-/* 6. Focus on the Reject button must reject, never approve. */
-{
-  const window = makeWindow();
-  const panel = buildApprovalPanel(window.document);
-  panel.buttons[0].focus();
-  const outcomes = [];
-  const pending = makePending("approval:1", { outcomeLog: outcomes });
-  const loaded = loadPlugin(window, makeUiSession([pending]));
-  const event = press(loaded, { target: panel.buttons[0] });
-  check("6 focused Reject keeps its native Space rejection", event.defaultPrevented === false && outcomes.length === 0);
-}
-
-/* 7. IME composition. */
-{
-  const window = makeWindow();
-  buildApprovalPanel(window.document);
-  const outcomes = [];
-  const pending = makePending("approval:1", { outcomeLog: outcomes });
-  const loaded = loadPlugin(window, makeUiSession([pending]));
-  const event = press(loaded, { isComposing: true, keyCode: 229 });
-  check("7 composing Space (IME) never approves", event.defaultPrevented === false && outcomes.length === 0);
-}
-
-/* 8. Auto-repeat. */
-{
-  const window = makeWindow();
-  buildApprovalPanel(window.document);
-  const outcomes = [];
-  const pending = makePending("approval:1", { outcomeLog: outcomes });
-  const loaded = loadPlugin(window, makeUiSession([pending]));
-  const event = press(loaded, { repeat: true });
-  check("8 held Space never re-fires", event.defaultPrevented === false && outcomes.length === 0);
-}
-
-/* 9. Chorded Space. */
-{
-  const window = makeWindow();
-  buildApprovalPanel(window.document);
-  const outcomes = [];
-  const pending = makePending("approval:1", { outcomeLog: outcomes });
-  const loaded = loadPlugin(window, makeUiSession([pending]));
-  const event = press(loaded, { key: " ", ctrlKey: true });
-  check("9 Ctrl+Space is left alone", event.defaultPrevented === false && outcomes.length === 0);
-}
-
-/* 10. Hidden panel. */
+/* A11 / A12 — hidden and inert panels */
 {
   const window = makeWindow();
   buildApprovalPanel(window.document, { visible: false });
-  const outcomes = [];
-  const pending = makePending("approval:1", { outcomeLog: outcomes });
-  const loaded = loadPlugin(window, makeUiSession([pending]));
-  const event = press(loaded);
-  check("10 hidden panel is not answerable", event.defaultPrevented === false && outcomes.length === 0);
+  const shortcuts = makeShortcuts();
+  const pending = trackedPending("approval:1");
+  loadPlugin(window, { uiSession: makeUiSession([pending]), shortcuts });
+  check("A11 hidden panel is not answerable", shortcuts.emit(fixedInput()) === false && outcomesOf(pending).length === 0);
 }
-
-/* 11. Inert ancestor. */
 {
   const window = makeWindow();
   const panel = buildApprovalPanel(window.document);
@@ -441,194 +505,131 @@ console.log("=".repeat(78));
   inert.setAttribute("inert", "");
   window.document.body.appendChild(inert);
   inert.appendChild(panel.root);
-  const outcomes = [];
-  const pending = makePending("approval:1", { outcomeLog: outcomes });
-  const loaded = loadPlugin(window, makeUiSession([pending]));
-  const event = press(loaded);
-  check("11 panel inside [inert] is not answerable", event.defaultPrevented === false && outcomes.length === 0);
+  const shortcuts = makeShortcuts();
+  const pending = trackedPending("approval:1");
+  loadPlugin(window, { uiSession: makeUiSession([pending]), shortcuts });
+  check("A12 panel inside [inert] is not answerable", shortcuts.emit(fixedInput()) === false && outcomesOf(pending).length === 0);
 }
 
-/* 12. Ambiguous split view with two visible panels. */
+/* A13 — ambiguous split view */
 {
   const window = makeWindow();
   buildApprovalPanel(window.document, { key: "approval:1" });
   buildApprovalPanel(window.document, { key: "approval:2" });
-  const outcomes = [];
-  const first = makePending("approval:1", { outcomeLog: outcomes });
-  const second = makePending("approval:2", { outcomeLog: outcomes });
-  const loaded = loadPlugin(window, makeUiSession([first, second]));
-  const event = press(loaded);
-  check("12 multiple visible panels are ambiguous and ignored", event.defaultPrevented === false && outcomes.length === 0);
+  const shortcuts = makeShortcuts();
+  const first = trackedPending("approval:1");
+  const second = trackedPending("approval:2");
+  loadPlugin(window, { uiSession: makeUiSession([first, second]), shortcuts });
+  check("A13 multiple visible panels are ignored", shortcuts.emit(fixedInput()) === false && outcomesOf(first).length === 0 && outcomesOf(second).length === 0);
 }
 
-/* 13. Three-button card: never the persistent grant. */
-{
-  const window = makeWindow();
-  const panel = buildApprovalPanel(window.document, { labels: ["拒绝", "允许一次", "始终允许"] });
-  const outcomes = [];
-  const pending = makePending("approval:1", { outcomeLog: outcomes });
-  const loaded = loadPlugin(window, makeUiSession([pending]));
-  const event = press(loaded);
-  check("13 Always-allow card answers allowed-once only", JSON.stringify(outcomes) === '["allowed-once"]', JSON.stringify(outcomes));
-  check("13 no button clicked (cannot hit Always allow)", panel.buttons.every((b) => b.__clicks === 0));
-}
-
-/* 14. Key mismatch between panel and pending request. */
+/* A14 — panel/pending key mismatch */
 {
   const window = makeWindow();
   buildApprovalPanel(window.document, { key: "approval:1" });
-  const outcomes = [];
-  const pending = makePending("approval:9", { outcomeLog: outcomes });
-  const loaded = loadPlugin(window, makeUiSession([pending]));
-  const event = press(loaded);
-  check("14 panel/pending key mismatch is ignored", event.defaultPrevented === false && outcomes.length === 0);
+  const shortcuts = makeShortcuts();
+  const pending = trackedPending("approval:9");
+  loadPlugin(window, { uiSession: makeUiSession([pending]), shortcuts });
+  check("A14 key mismatch is ignored", shortcuts.emit(fixedInput()) === false && outcomesOf(pending).length === 0);
 }
 
-/* 15. Already settled request. */
+/* A15 — already settled */
 {
   const window = makeWindow();
   buildApprovalPanel(window.document);
-  const outcomes = [];
-  const pending = makePending("approval:1", { answerable: false, outcomeLog: outcomes });
-  const loaded = loadPlugin(window, makeUiSession([pending]));
-  const event = press(loaded);
-  check("15 settled request is not answered twice", event.defaultPrevented === false && outcomes.length === 0);
+  const shortcuts = makeShortcuts();
+  const pending = trackedPending("approval:1", { answerable: false });
+  loadPlugin(window, { uiSession: makeUiSession([pending]), shortcuts });
+  check("A15 settled request is not answered again", shortcuts.emit(fixedInput()) === false && outcomesOf(pending).length === 0);
 }
 
-/* 16. Fallback: a future host without answer() clicks Allow once, never Always allow. */
+/* A16 — Always-allow card */
 {
   const window = makeWindow();
   const panel = buildApprovalPanel(window.document, { labels: ["拒绝", "允许一次", "始终允许"] });
-  const pending = { kind: "approval", key: "approval:1", answerable: true };
-  const loaded = loadPlugin(window, makeUiSession([pending]));
-  press(loaded);
-  check(
-    "16 fallback clicks Allow once (index 1), not Always allow (index 2)",
-    panel.buttons[1].__clicks === 1 && panel.buttons[2].__clicks === 0 && panel.buttons[0].__clicks === 0,
-    `clicks=[${panel.buttons.map((b) => b.__clicks)}]`,
-  );
+  const shortcuts = makeShortcuts();
+  const pending = trackedPending("approval:1");
+  loadPlugin(window, { uiSession: makeUiSession([pending]), shortcuts });
+  shortcuts.emit(fixedInput());
+  check("A16 Always-allow card answers allowed-once only", JSON.stringify(outcomesOf(pending)) === '["allowed-once"]', JSON.stringify(outcomesOf(pending)));
+  check("A16 no button clicked (cannot hit Always allow)", panel.buttons.every((button) => button.__clicks === 0));
 }
 
-/* 17. Detail-region button does not shift the fallback index. */
+/* A17 — stale panel without a pending request */
 {
   const window = makeWindow();
-  const panel = buildApprovalPanel(window.document, { labels: ["拒绝", "允许一次", "始终允许"] });
-  const detailButton = new Element("button", window.document);
-  detailButton.textContent = "展开 diff";
-  panel.detail.appendChild(detailButton);
-  const pending = { kind: "approval", key: "approval:1", answerable: true };
-  const loaded = loadPlugin(window, makeUiSession([pending]));
-  press(loaded);
-  check(
-    "17 detail-region buttons are excluded from the fallback decision",
-    panel.buttons[1].__clicks === 1 && detailButton.__clicks === 0,
-    `clicks=${panel.buttons[1].__clicks}/${detailButton.__clicks}`,
-  );
+  buildApprovalPanel(window.document);
+  const shortcuts = makeShortcuts();
+  loadPlugin(window, { uiSession: makeUiSession([]), shortcuts });
+  check("A17 stale panel with no pending request is ignored", shortcuts.emit(fixedInput()) === false);
 }
 
-/* 18. Space on the detail region (not a button) does approve. */
+/* A18 — the reported flow: focus is on a sidebar button after switching sessions */
+{
+  const window = makeWindow();
+  const panel = buildApprovalPanel(window.document);
+  const sidebar = new Element("button", window.document);
+  window.document.body.appendChild(sidebar);
+  sidebar.focus();
+  const shortcuts = makeShortcuts();
+  const pending = trackedPending("approval:1");
+  loadPlugin(window, { uiSession: makeUiSession([pending]), shortcuts });
+  const consumed = shortcuts.emit(fixedInput({ target: sidebar }));
+  check("A18 Space approves although focus sits on a sidebar button", JSON.stringify(outcomesOf(pending)) === '["allowed-once"]', JSON.stringify(outcomesOf(pending)));
+  check("A18 the key is consumed so the sidebar button is not activated", consumed === true);
+  check("A18 card buttons untouched", panel.buttons.every((button) => button.__clicks === 0));
+}
+
+/* A19 — focus on the card's Reject button keeps native activation */
+{
+  const window = makeWindow();
+  const panel = buildApprovalPanel(window.document);
+  panel.buttons[0].focus();
+  const shortcuts = makeShortcuts();
+  const pending = trackedPending("approval:1");
+  loadPlugin(window, { uiSession: makeUiSession([pending]), shortcuts });
+  const consumed = shortcuts.emit(fixedInput({ target: panel.buttons[0] }));
+  check("A19 focused Reject keeps its native Space rejection", consumed === false && outcomesOf(pending).length === 0);
+}
+
+/* A20 — reading the detail region still approves */
 {
   const window = makeWindow();
   const panel = buildApprovalPanel(window.document);
   panel.detail.focus();
-  const outcomes = [];
-  const pending = makePending("approval:1", { outcomeLog: outcomes });
-  const loaded = loadPlugin(window, makeUiSession([pending]));
-  const event = press(loaded, { target: panel.detail });
-  check("18 Space while reading the approval detail approves once", JSON.stringify(outcomes) === '["allowed-once"]' && event.defaultPrevented, JSON.stringify(outcomes));
+  const shortcuts = makeShortcuts();
+  const pending = trackedPending("approval:1");
+  loadPlugin(window, { uiSession: makeUiSession([pending]), shortcuts });
+  const consumed = shortcuts.emit(fixedInput({ target: panel.detail }));
+  check("A20 Space on the detail region approves once", consumed === true && JSON.stringify(outcomesOf(pending)) === '["allowed-once"]');
 }
 
-/* 19. Open modal unrelated to the approval card blocks the shortcut. */
+/* A21 — second press */
 {
   const window = makeWindow();
   buildApprovalPanel(window.document);
-  const dialog = new Element("div", window.document);
-  dialog.setAttribute("role", "dialog");
-  dialog.setAttribute("aria-modal", "true");
-  window.document.body.appendChild(dialog);
-  const outcomes = [];
-  const pending = makePending("approval:1", { outcomeLog: outcomes });
-  const loaded = loadPlugin(window, makeUiSession([pending]));
-  const event = press(loaded);
-  check("19 an unrelated open modal suppresses Space approval", event.defaultPrevented === false && outcomes.length === 0);
+  const shortcuts = makeShortcuts();
+  const pending = trackedPending("approval:1");
+  loadPlugin(window, { uiSession: makeUiSession([pending]), shortcuts });
+  const first = shortcuts.emit(fixedInput());
+  const second = shortcuts.emit(fixedInput());
+  check("A21 second Space does not answer again", first === true && second === false && outcomesOf(pending).length === 1, JSON.stringify(outcomesOf(pending)));
 }
 
-/* 20. Unmount removes the listener. */
+/* A22 — missing uiSession */
 {
   const window = makeWindow();
   buildApprovalPanel(window.document);
-  const outcomes = [];
-  const pending = makePending("approval:1", { outcomeLog: outcomes });
-  const loaded = loadPlugin(window, makeUiSession([pending]));
-  loaded.dispose();
-  const event = press(loaded);
-  check("20 unload removes the keydown listener", event.defaultPrevented === false && outcomes.length === 0);
+  const shortcuts = makeShortcuts();
+  loadPlugin(window, { shortcuts });
+  check("A22 missing uiSession disables the plugin", shortcuts.listeners.size === 0);
 }
 
-/* 21. Shift+Space (a common IME full-width toggle) is untouched. */
-{
-  const window = makeWindow();
-  buildApprovalPanel(window.document);
-  const outcomes = [];
-  const pending = makePending("approval:1", { outcomeLog: outcomes });
-  const loaded = loadPlugin(window, makeUiSession([pending]));
-  const event = press(loaded, { shiftKey: true });
-  check("21 Shift+Space is left to the system/IME", event.defaultPrevented === false && outcomes.length === 0);
-}
-
-/* 22. Second Space after the request was answered is a no-op. */
-{
-  const window = makeWindow();
-  buildApprovalPanel(window.document);
-  const outcomes = [];
-  const pending = makePending("approval:1", { outcomeLog: outcomes });
-  const loaded = loadPlugin(window, makeUiSession([pending]));
-  const first = press(loaded);
-  const second = press(loaded);
-  check(
-    "22 second Space does not answer again",
-    JSON.stringify(outcomes) === '["allowed-once"]' && second.defaultPrevented === false,
-    `outcomes=${JSON.stringify(outcomes)} prevented2=${second.defaultPrevented}`,
-  );
-}
-
-/* 23. Two pending sessions, one visible panel: only the matching key is answered. */
-{
-  const window = makeWindow();
-  buildApprovalPanel(window.document, { key: "approval:2" });
-  const outcomesA = [];
-  const outcomesB = [];
-  const first = makePending("approval:1", { outcomeLog: outcomesA });
-  const second = makePending("approval:2", { outcomeLog: outcomesB });
-  const loaded = loadPlugin(window, makeUiSession([first, second]));
-  press(loaded);
-  check(
-    "23 only the visible panel's request is answered",
-    outcomesA.length === 0 && JSON.stringify(outcomesB) === '["allowed-once"]',
-    `A=${JSON.stringify(outcomesA)} B=${JSON.stringify(outcomesB)}`,
-  );
-}
-
-/* 24. contenteditable target/focus is typing, not approval. */
-{
-  const window = makeWindow();
-  buildApprovalPanel(window.document);
-  const editor = new Element("div", window.document);
-  editor.setAttribute("contenteditable", "true");
-  editor.isContentEditable = true;
-  window.document.body.appendChild(editor);
-  editor.focus();
-  const outcomes = [];
-  const pending = makePending("approval:1", { outcomeLog: outcomes });
-  const loaded = loadPlugin(window, makeUiSession([pending]));
-  const event = press(loaded, { target: editor });
-  check("24 contenteditable Space is not intercepted", event.defaultPrevented === false && outcomes.length === 0);
-}
-
-/* 25. A throwing answer must not fall back to clicking a button. */
+/* A23 — answer() throws: no fallback click */
 {
   const window = makeWindow();
   const panel = buildApprovalPanel(window.document);
+  const shortcuts = makeShortcuts();
   const pending = {
     kind: "approval",
     key: "approval:1",
@@ -637,19 +638,16 @@ console.log("=".repeat(78));
       throw new Error("already settled");
     },
   };
-  const loaded = loadPlugin(window, makeUiSession([pending]));
-  const event = press(loaded);
-  check(
-    "25 failed semantic answer does not click a fallback button",
-    event.defaultPrevented === false && panel.buttons.every((b) => b.__clicks === 0),
-    `clicks=[${panel.buttons.map((b) => b.__clicks)}]`,
-  );
+  loadPlugin(window, { uiSession: makeUiSession([pending]), shortcuts });
+  const consumed = shortcuts.emit(fixedInput());
+  check("A23 failed semantic answer does not click a button", consumed === false && panel.buttons.every((button) => button.__clicks === 0));
 }
 
-/* 26. A rejected answer promise is contained (no unhandled rejection, no click). */
+/* A24 — answer() rejects: contained, still consumed, no click */
 {
   const window = makeWindow();
   const panel = buildApprovalPanel(window.document);
+  const shortcuts = makeShortcuts();
   const pending = {
     kind: "approval",
     key: "approval:1",
@@ -658,40 +656,110 @@ console.log("=".repeat(78));
       return Promise.reject(new Error("host refused"));
     },
   };
-  const loaded = loadPlugin(window, makeUiSession([pending]));
-  const event = press(loaded);
-  check(
-    "26 rejected answer is contained and does not click a button",
-    event.defaultPrevented === true && panel.buttons.every((b) => b.__clicks === 0),
-    `clicks=[${panel.buttons.map((b) => b.__clicks)}]`,
-  );
+  loadPlugin(window, { uiSession: makeUiSession([pending]), shortcuts });
+  const consumed = shortcuts.emit(fixedInput());
+  check("A24 rejected answer is contained and consumed", consumed === true && panel.buttons.every((button) => button.__clicks === 0));
 }
 
-/* 27. No uiSession service: plugin disables itself instead of guessing. */
-{
-  const window = makeWindow();
-  const panel = buildApprovalPanel(window.document);
-  const loaded = loadPlugin(window);
-  const event = press(loaded);
-  check(
-    "27 missing uiSession service disables Space approval",
-    event.defaultPrevented === false && panel.buttons.every((b) => b.__clicks === 0),
-  );
-}
-
-/* 28. Focused link keeps native Space activation. */
+/* A25 — unload */
 {
   const window = makeWindow();
   buildApprovalPanel(window.document);
-  const link = new Element("a", window.document);
-  link.setAttribute("href", "#somewhere");
-  window.document.body.appendChild(link);
-  link.focus();
-  const outcomes = [];
-  const pending = makePending("approval:1", { outcomeLog: outcomes });
-  const loaded = loadPlugin(window, makeUiSession([pending]));
-  const event = press(loaded, { target: link });
-  check("28 focused link keeps native Space", event.defaultPrevented === false && outcomes.length === 0);
+  const shortcuts = makeShortcuts();
+  const pending = trackedPending("approval:1");
+  const loaded = loadPlugin(window, { uiSession: makeUiSession([pending]), shortcuts });
+  loaded.dispose();
+  check("A25 unload removes the fixed-input listener", shortcuts.listeners.size === 0 && shortcuts.emit(fixedInput()) === false);
+}
+
+console.log("\n" + "=".repeat(78));
+console.log("B. document keydown fallback (no shortcuts service)");
+console.log("=".repeat(78));
+
+/* B1 — Space approves from the page region */
+{
+  const window = makeWindow();
+  const panel = buildApprovalPanel(window.document);
+  const pending = trackedPending("approval:1");
+  const loaded = loadPlugin(window, { uiSession: makeUiSession([pending]) });
+  check("B1 fallback bundle applies", loaded.exports && !loaded.error, loaded.error ? String(loaded.error) : "");
+  const event = pressDom(loaded);
+  check("B1 Space answers allowed-once", JSON.stringify(outcomesOf(pending)) === '["allowed-once"]', JSON.stringify(outcomesOf(pending)));
+  check("B1 Space is consumed (no page scroll)", event.defaultPrevented === true);
+  check("B1 no button clicked", panel.buttons.every((button) => button.__clicks === 0));
+}
+
+/* B2 — typing keeps Space */
+{
+  const window = makeWindow();
+  buildApprovalPanel(window.document);
+  const textarea = new Element("textarea", window.document);
+  window.document.body.appendChild(textarea);
+  textarea.focus();
+  const pending = trackedPending("approval:1");
+  const loaded = loadPlugin(window, { uiSession: makeUiSession([pending]) });
+  const event = pressDom(loaded, { target: textarea });
+  check("B2 Space typed in a textarea is not intercepted", event.defaultPrevented === false && outcomesOf(pending).length === 0);
+}
+
+/* B3 — Escape rejects */
+{
+  const window = makeWindow();
+  buildApprovalPanel(window.document);
+  const pending = trackedPending("approval:1");
+  const loaded = loadPlugin(window, { uiSession: makeUiSession([pending]) });
+  const event = pressDom(loaded, { key: "Escape", code: "Escape" });
+  check("B3 Escape answers rejected", JSON.stringify(outcomesOf(pending)) === '["rejected"]', JSON.stringify(outcomesOf(pending)));
+  check("B3 Escape is consumed", event.defaultPrevented === true);
+}
+
+/* B4 — focus on a control outside the card */
+{
+  const window = makeWindow();
+  buildApprovalPanel(window.document);
+  const sidebar = new Element("button", window.document);
+  window.document.body.appendChild(sidebar);
+  sidebar.focus();
+  const pending = trackedPending("approval:1");
+  const loaded = loadPlugin(window, { uiSession: makeUiSession([pending]) });
+  const event = pressDom(loaded, { target: sidebar });
+  check("B4 Space approves although focus is on a sidebar button", JSON.stringify(outcomesOf(pending)) === '["allowed-once"]', JSON.stringify(outcomesOf(pending)));
+  check("B4 the key is consumed", event.defaultPrevented === true);
+}
+
+/* B5 — the official handler already answered */
+{
+  const window = makeWindow();
+  buildApprovalPanel(window.document);
+  const pending = trackedPending("approval:1");
+  const loaded = loadPlugin(window, { uiSession: makeUiSession([pending]) });
+  const event = pressDom(loaded, { defaultPrevented: true });
+  check("B5 an already handled key is not answered twice", event.defaultPrevented === true && outcomesOf(pending).length === 0);
+}
+
+/* B6 — fallback click when the host has no answer() */
+{
+  const window = makeWindow();
+  const panel = buildApprovalPanel(window.document, { labels: ["拒绝", "允许一次", "始终允许"] });
+  const pending = { kind: "approval", key: "approval:1", answerable: true };
+  const loaded = loadPlugin(window, { uiSession: makeUiSession([pending]) });
+  pressDom(loaded);
+  check(
+    "B6 fallback clicks Allow once, never Always allow",
+    panel.buttons[1].__clicks === 1 && panel.buttons[0].__clicks === 0 && panel.buttons[2].__clicks === 0,
+    `clicks=[${panel.buttons.map((button) => button.__clicks)}]`,
+  );
+}
+
+/* B7 — unload */
+{
+  const window = makeWindow();
+  buildApprovalPanel(window.document);
+  const pending = trackedPending("approval:1");
+  const loaded = loadPlugin(window, { uiSession: makeUiSession([pending]) });
+  loaded.dispose();
+  const event = pressDom(loaded);
+  check("B7 unload removes the DOM listener", event.defaultPrevented === false && outcomesOf(pending).length === 0);
 }
 
 /* -------------------------------- summary -------------------------------- */

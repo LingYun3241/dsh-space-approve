@@ -2,19 +2,28 @@ window.__ModuleLoader__.load({
   id: "dsh-space-approve",
   factory(require) {
     /**
-     * Space approves the pending approval request exactly once.
+     * Space approves / Escape rejects the pending approval request, without
+     * requiring the user to click the approval card first.
+     *
+     * Input path: the official `shortcuts` service (`observeFixedInput`) hands
+     * us normalized key facts (code, modifiers, repeat, IME composition, modal,
+     * input region), so IME/dead-key/AltGraph handling and modal tracking stay
+     * owned by the host. When that service is missing we fall back to a plain
+     * document keydown listener with equivalent local guards.
      *
      * Safety model, in order of importance:
-     * 1. Semantic answer: the pending interaction object published by
-     *    `uiSession.sessionStatus` answers `"allowed-once"` — the same outcome
-     *    the official Enter handler produces. We never click "the last button",
-     *    so an optional "Always allow" can never be triggered by Space.
-     * 2. Only the visible, actually-pending approval request is answerable:
-     *    exactly one visible `[data-approval-key]` panel, and a matching
-     *    pending interaction whose key equals the panel's key.
-     * 3. Typing is never hijacked: editable targets, editable focus, focused
-     *    buttons/links, IME composition, key repeat and chorded Space all pass
-     *    through untouched.
+     * 1. Semantic answer: the pending interaction published by
+     *    `uiSession.sessionStatus` answers `"allowed-once"` / `"rejected"` — the
+     *    same outcomes the official Enter/Escape handlers produce. We never
+     *    click "the last button", so an optional "Always allow" can never be
+     *    triggered by Space.
+     * 2. Only the visible, actually-pending request is answerable: exactly one
+     *    visible `[data-approval-key]` panel, and a pending interaction whose
+     *    key matches that panel.
+     * 3. Typing and focused controls keep their keys: editable region,
+     *    `document.activeElement` in an editor, IME composition, key repeat,
+     *    chorded keys, unrelated modals, and buttons *inside* the card (native
+     *    activation is the user's intent there) all pass through untouched.
      */
 
     const PANEL = "[data-approval-key]";
@@ -22,7 +31,7 @@ window.__ModuleLoader__.load({
     const EDITABLE =
       'input, textarea, select, [contenteditable="true"], [contenteditable=""], [role="textbox"], [role="combobox"]';
     const ACTIVATABLE =
-      'button, a[href], [role="button"], input[type="checkbox"], input[type="radio"], summary';
+      'button, a[href], [role="button"], [role="combobox"], [role="switch"], input[type="checkbox"], input[type="radio"], summary';
     const MODAL = '[role="dialog"][aria-modal="true"], dialog[open]';
 
     /** Debug switch: `localStorage.setItem("dsh-space-approve:debug", "1")`. */
@@ -40,8 +49,8 @@ window.__ModuleLoader__.load({
     const isElement = (value) => typeof Element !== "undefined" && value instanceof Element;
     const closestOf = (node, selector) =>
       isElement(node) && typeof node.closest === "function" ? node.closest(selector) : null;
-    const isEditable = (node) => isElement(node) && (node.isContentEditable === true || closestOf(node, EDITABLE) !== null);
-    const isSpace = (event) => event.key === " " || event.key === "Spacebar" || event.code === "Space";
+    const isEditable = (node) =>
+      isElement(node) && (node.isContentEditable === true || closestOf(node, EDITABLE) !== null);
 
     /** A panel counts only when it is really on screen (not inert, hidden or display:none). */
     const isVisible = (panel) => {
@@ -89,24 +98,33 @@ window.__ModuleLoader__.load({
       return null;
     };
 
-    /** Fallback for a future host that stops exposing `answer()`; never the persistent grant. */
-    const clickAllowOnce = (panel) => {
+    /** Decision buttons of the card, excluding any control rendered inside the detail region. */
+    const decisionButtons = (panel) => {
       const detail = panel.querySelector(DETAIL);
-      const buttons = Array.from(panel.querySelectorAll("button")).filter(
+      return Array.from(panel.querySelectorAll("button")).filter(
         (button) => !button.disabled && (detail === null || !detail.contains(button)),
       );
+    };
+
+    /**
+     * Fallback for a host that stops exposing `answer()`: click the button that
+     * carries this outcome. Never the persistent grant:
+     * [Reject, Allow once] or [Reject, Allow once, Always allow].
+     */
+    const clickDecision = (panel, action) => {
+      const buttons = decisionButtons(panel);
       if (buttons.length === 0) return false;
-      // [Reject, Allow once] or [Reject, Allow once, Always allow].
-      const button = buttons.length >= 3 ? buttons[buttons.length - 2] : buttons[buttons.length - 1];
+      const button = action === "reject" ? buttons[0] : buttons.length >= 3 ? buttons[buttons.length - 2] : buttons[buttons.length - 1];
       if (!button) return false;
       button.click();
       return true;
     };
 
-    const approveOnce = (panel, pending) => {
-      if (pending && typeof pending.answer === "function") {
+    const decide = (panel, pending, action) => {
+      const outcome = action === "reject" ? "rejected" : "allowed-once";
+      if (typeof pending.answer === "function") {
         try {
-          const result = pending.answer("allowed-once");
+          const result = pending.answer(outcome);
           if (result && typeof result.catch === "function") result.catch((error) => log("answer rejected", error));
           return true;
         } catch (error) {
@@ -116,62 +134,152 @@ window.__ModuleLoader__.load({
           return false;
         }
       }
-      return clickAllowOnce(panel);
+      return clickDecision(panel, action);
     };
 
-    function createHandler(uiSession) {
-      return (event) => {
+    function createHandler({ uiSession, escapeEnabled }) {
+      /**
+       * Resolve the single pending, visible approval request.
+       * `null` means "do not act" (nothing pending, stale DOM, hidden panel, or
+       * an ambiguous split view).
+       */
+      const resolveTarget = () => {
+        const panels = Array.from(document.querySelectorAll(PANEL)).filter(isVisible);
+        if (panels.length !== 1) return null;
+        const panel = panels[0];
+        const modal = document.querySelector(MODAL);
+        if (modal && typeof modal.contains === "function" && !modal.contains(panel)) return null;
+        const pending = pendingFor(uiSession, panel.getAttribute("data-approval-key"));
+        if (!pending) return null;
+        return { panel, pending };
+      };
+
+      /** A focused editor owns the key even when the reported region says otherwise. */
+      const editingSomewhere = () => {
+        const active = document.activeElement;
+        return Boolean(active) && active !== document.body && isEditable(active);
+      };
+
+      /**
+       * A decision control inside the card keeps its own key: Space activates it
+       * natively, and Escape is already answered by the card's own handler.
+       */
+      const activatableInsideCard = (panel) => {
+        const active = document.activeElement;
+        return Boolean(active) && active !== document.body && panel.contains(active) && closestOf(active, ACTIVATABLE) !== null;
+      };
+
+      /** Any focus inside the card delegates both keys to the card's own handlers. */
+      const focusedInsideCard = (panel) => {
+        const active = document.activeElement;
+        return Boolean(active) && active !== document.body && panel.contains(active);
+      };
+
+      const run = (action, delegate) => {
+        const target = resolveTarget();
+        if (target === null) return false;
+        if (delegate(target.panel)) return false;
+        if (!decide(target.panel, target.pending, action)) return false;
+        log(action === "reject" ? "rejected with Escape" : "approved once with Space", target.pending.key);
+        return true;
+      };
+
+      /** Official path: normalized input from the shortcuts service. */
+      const onFixedInput = (input) => {
         try {
-          if (event.defaultPrevented || event.repeat || event.isComposing || event.keyCode === 229) return;
-          if (!isSpace(event)) return;
-          if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
-          if (!isElement(event.target)) return;
-          if (isEditable(event.target)) return;
-
-          const active = document.activeElement;
-          if (active && active !== event.target && isEditable(active)) return;
-          // A focused control owns Space (native activation); never turn that into an approval.
-          if (active && active !== document.body && closestOf(active, ACTIVATABLE) !== null) return;
-          if (closestOf(event.target, ACTIVATABLE) !== null) return;
-
-          const panels = Array.from(document.querySelectorAll(PANEL)).filter(isVisible);
-          if (panels.length !== 1) return; // no request, or an ambiguous split view
-          const panel = panels[0];
-
-          const modal = document.querySelector(MODAL);
-          if (modal && typeof modal.contains === "function" && !modal.contains(panel)) return;
-
-          const pending = pendingFor(uiSession, panel.getAttribute("data-approval-key"));
-          if (!pending) return;
-          if (!approveOnce(panel, pending)) return;
-
-          event.preventDefault();
-          if (typeof event.stopPropagation === "function") event.stopPropagation();
-          log("approved once with Space", pending.key);
+          if (!input || input.type !== "keydown") return;
+          if (!escapeEnabled && input.gesture && input.gesture.code === "Escape") return;
+          const action = actionOf(input.gesture);
+          if (action === null) return;
+          const gesture = input.gesture;
+          if (gesture.defaultPrevented || gesture.composing || gesture.repeat) return;
+          if (gesture.control || gesture.alt || gesture.shift || gesture.meta) return;
+          const context = input.context;
+          if (context && context.region !== "page") return;
+          if (context && context.modal !== null && context.modal !== undefined) return;
+          if (editingSomewhere()) return;
+          if (!run(action, activatableInsideCard)) return;
+          if (typeof input.consume === "function") input.consume();
         } catch (error) {
-          log("handler failed", error);
+          log("fixed input handler failed", error);
         }
       };
+
+      /** Fallback path: raw document keydown, same business rules. */
+      const onDomKeyDown = (event) => {
+        try {
+          if (!event || event.defaultPrevented || event.repeat || event.isComposing || event.keyCode === 229) return;
+          const action = actionOfDom(event);
+          if (action === null) return;
+          if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+          if (!isElement(event.target)) return;
+          if (isEditable(event.target) || editingSomewhere()) return;
+          if (!run(action, focusedInsideCard)) return;
+          event.preventDefault();
+          if (typeof event.stopPropagation === "function") event.stopPropagation();
+        } catch (error) {
+          log("dom handler failed", error);
+        }
+      };
+
+      return { onFixedInput, onDomKeyDown };
+    }
+
+    /** Space → allow once; Escape → reject (when enabled). */
+    function actionOf(gesture) {
+      if (!gesture) return null;
+      if (gesture.code === "Space" || gesture.code === "Spacebar") return "allow";
+      if (gesture.code === "Escape" || gesture.code === "Esc") return "reject";
+      return null;
+    }
+
+    function actionOfDom(event) {
+      const key = event.key;
+      const code = event.code;
+      if (key === " " || key === "Spacebar" || code === "Space") return "allow";
+      if (key === "Escape" || key === "Esc" || code === "Escape") return "reject";
+      return null;
     }
 
     return {
       inject: ["uiSession"],
-      apply(ctx) {
-        const uiSession =
-          typeof ctx.get === "function" ? ctx.get("uiSession") : undefined;
+      apply(ctx, config) {
+        const uiSession = typeof ctx.get === "function" ? ctx.get("uiSession") : undefined;
         const service = uiSession || ctx.uiSession;
         if (!service || !service.sessionStatus) {
           console.warn("[space-approve] uiSession service unavailable; Space approval disabled");
           return;
         }
-        const handler = createHandler(service);
-        document.addEventListener("keydown", handler, true);
+        const escapeEnabled = !config || config.escape !== false;
+        const shortcuts = typeof ctx.get === "function" ? ctx.get("shortcuts") : undefined;
+        const handler = createHandler({ uiSession: service, escapeEnabled });
+        const disposers = [];
+        let mode = "dom";
+
+        if (shortcuts && typeof shortcuts.observeFixedInput === "function") {
+          const off = shortcuts.observeFixedInput(handler.onFixedInput);
+          if (typeof off === "function") disposers.push(off);
+          mode = "shortcuts";
+        } else {
+          document.addEventListener("keydown", handler.onDomKeyDown, true);
+          disposers.push(() => document.removeEventListener("keydown", handler.onDomKeyDown, true));
+        }
+
         if (typeof ctx.effect === "function") {
           ctx.effect(
-            () => () => document.removeEventListener("keydown", handler, true),
-            "dsh-space-approve: Space approves once",
+            () => () => {
+              for (const dispose of disposers) {
+                try {
+                  dispose();
+                } catch (error) {
+                  log("dispose failed", error);
+                }
+              }
+            },
+            "dsh-space-approve: Space approves once, Escape rejects",
           );
         }
+        log("active via", mode, "| escape:", escapeEnabled);
       },
     };
   },
