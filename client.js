@@ -236,7 +236,14 @@ window.__ModuleLoader__.load({
         }
       };
 
-      /** Fallback path: raw document keydown, same business rules. */
+      /**
+       * Fallback path: raw document keydown, same business rules.
+       *
+       * Registered in the CAPTURE phase on purpose: it must run before handlers
+       * on a focused control (for example the sidebar row the user just clicked)
+       * can call `preventDefault()` on Space, which would otherwise make the key
+       * silently do nothing.
+       */
       const onDomKeyDown = (event) => {
         try {
           if (event && (event.code === "Space" || event.code === "Escape" || event.code === "Enter")) {
@@ -256,7 +263,7 @@ window.__ModuleLoader__.load({
           if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
           if (!isElement(event.target)) return;
           if (isEditable(event.target) || editingSomewhere()) return;
-          const acted = run(action, focusedInsideCard);
+          const acted = run(action, activatableInsideCard);
           record(diagnostics.decisions, { via: "dom", action, acted });
           if (!acted) return;
           event.preventDefault();
@@ -298,15 +305,20 @@ window.__ModuleLoader__.load({
         const shortcuts = typeof ctx.get === "function" ? ctx.get("shortcuts") : undefined;
         const handler = createHandler({ uiSession: service, escapeEnabled });
         const disposers = [];
-        let mode = "dom";
 
+        // Primary: capture-phase document listener. It runs before control-level
+        // handlers that may swallow Space with preventDefault(), and it stops
+        // propagation when it answers, so the official path below never doubles.
+        document.addEventListener("keydown", handler.onDomKeyDown, true);
+        disposers.push(() => document.removeEventListener("keydown", handler.onDomKeyDown, true));
+
+        // Secondary: the host's normalized input, for events our listener never
+        // sees (native-bridge delivery, or a document that swallowed capture).
+        let mode = "dom";
         if (shortcuts && typeof shortcuts.observeFixedInput === "function") {
           const off = shortcuts.observeFixedInput(handler.onFixedInput);
           if (typeof off === "function") disposers.push(off);
-          mode = "shortcuts";
-        } else {
-          document.addEventListener("keydown", handler.onDomKeyDown, true);
-          disposers.push(() => document.removeEventListener("keydown", handler.onDomKeyDown, true));
+          mode = "dom+shortcuts";
         }
 
         if (typeof ctx.effect === "function") {

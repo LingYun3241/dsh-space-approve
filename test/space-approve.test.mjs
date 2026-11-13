@@ -762,6 +762,41 @@ console.log("=".repeat(78));
   check("B7 unload removes the DOM listener", event.defaultPrevented === false && outcomesOf(pending).length === 0);
 }
 
+console.log("\n" + "=".repeat(78));
+console.log("C. capture-phase priority and dual-path safety");
+console.log("=".repeat(78));
+
+/* C1 — a control-level handler that swallows Space must not block approval */
+{
+  const window = makeWindow();
+  buildApprovalPanel(window.document);
+  const pending = trackedPending("approval:1");
+  const shortcuts = makeShortcuts();
+  const loaded = loadPlugin(window, { uiSession: makeUiSession([pending]), shortcuts });
+  // Simulates the focused sidebar row swallowing Space after us.
+  window.document.addEventListener("keydown", (event) => {
+    if (event.key === " ") event.preventDefault();
+  });
+  const event = pressDom(loaded);
+  check("C1 capture handler acts before a later preventDefault", JSON.stringify(outcomesOf(pending)) === '["allowed-once"]', JSON.stringify(outcomesOf(pending)));
+  check("C1 the key is consumed", event.defaultPrevented === true);
+}
+
+/* C2 — both paths installed, DOM acts, official path never doubles */
+{
+  const window = makeWindow();
+  buildApprovalPanel(window.document);
+  const pending = trackedPending("approval:1");
+  const shortcuts = makeShortcuts();
+  const loaded = loadPlugin(window, { uiSession: makeUiSession([pending]), shortcuts });
+  check("C2 both paths are installed", shortcuts.listeners.size === 1);
+  pressDom(loaded);
+  // The DOM path answered and stopped propagation; replaying the host's own
+  // normalized input for the same press must not answer a second time.
+  shortcuts.emit(fixedInput());
+  check("C2 a replayed host input does not answer twice", outcomesOf(pending).length === 1, JSON.stringify(outcomesOf(pending)));
+}
+
 /* -------------------------------- summary -------------------------------- */
 const passed = results.filter((result) => result.pass).length;
 console.log("\n" + "=".repeat(78));

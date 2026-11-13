@@ -42,15 +42,14 @@ DSH 自带的审批卡有两个限制：
 
 ## 输入路径
 
-优先使用 DSH 官方快捷键服务：
+两条路径同时工作，**捕获阶段优先**：
 
-```js
-ctx.shortcuts.observeFixedInput((input) => { /* gesture + context + consume */ })
-```
+1. **主路径**：`document` 的 **capture** 阶段 `keydown` 监听。它比“当前焦点控件自己的处理器”更早执行，因此即使你刚点过的侧栏按钮对空格调用了 `preventDefault()`，也不会把批准吞掉。应答后立即 `preventDefault()` + `stopPropagation()`。
+2. **兜底路径**：DSH 官方快捷键服务 `ctx.shortcuts.observeFixedInput()`。宿主返回归一化的 `{ gesture: { code, repeats, composing, defaultPrevented }, context: { region, modal }, consume() }`，覆盖 IME、死键、AltGraph、重复键与 modal 追踪。主路径已应答的按键会因 `stopPropagation` 到不了这里，因此不会重复应答。
 
-宿主的归一化结果 `{ gesture: { code, control/alt/shift/meta, repeat, composing, defaultPrevented }, context: { region, modal, target }, consume() }` 已经覆盖 IME、死键、AltGraph、重复键与 modal 追踪，插件只做业务判断：找到**唯一可见**的待批卡片 → 匹配 `uiSession.sessionStatus` 里的 pending 请求 → `answer("allowed-once" | "rejected")` → `consume()`。
+业务判断只有一套：找到**唯一可见**的待批卡片 → 匹配 `uiSession.sessionStatus` 中的 pending 请求 → `answer("allowed-once" | "rejected")`。
 
-服务不可用时**自动降级**为 `document` 的 `keydown` 监听（同等业务规则），所以不会因为宿主改版而整体失效。
+> 早期 1.0.x 只监听 DOM，空格可用但有焦点守卫；1.1.0 只走官方通道，会在“焦点控件的处理器先吞掉空格”时失效；1.1.1 起两者并存、捕获优先。
 
 ## 工作方式
 
