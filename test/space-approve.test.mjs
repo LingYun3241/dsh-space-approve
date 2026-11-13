@@ -258,7 +258,7 @@ function loadPlugin(window, uiSession) {
   } catch (error) {
     out.error = error;
   }
-  if (out.exports && typeof out.exports.apply === "function" && uiSession) {
+  if (out.exports && typeof out.exports.apply === "function") {
     try {
       out.exports.apply({
         get: (name) => (name === "uiSession" ? uiSession : undefined),
@@ -574,6 +574,124 @@ console.log("=".repeat(78));
   const loaded = loadPlugin(window, makeUiSession([pending]));
   const event = press(loaded, { shiftKey: true });
   check("21 Shift+Space is left to the system/IME", event.defaultPrevented === false && outcomes.length === 0);
+}
+
+/* 22. Second Space after the request was answered is a no-op. */
+{
+  const window = makeWindow();
+  buildApprovalPanel(window.document);
+  const outcomes = [];
+  const pending = makePending("approval:1", { outcomeLog: outcomes });
+  const loaded = loadPlugin(window, makeUiSession([pending]));
+  const first = press(loaded);
+  const second = press(loaded);
+  check(
+    "22 second Space does not answer again",
+    JSON.stringify(outcomes) === '["allowed-once"]' && second.defaultPrevented === false,
+    `outcomes=${JSON.stringify(outcomes)} prevented2=${second.defaultPrevented}`,
+  );
+}
+
+/* 23. Two pending sessions, one visible panel: only the matching key is answered. */
+{
+  const window = makeWindow();
+  buildApprovalPanel(window.document, { key: "approval:2" });
+  const outcomesA = [];
+  const outcomesB = [];
+  const first = makePending("approval:1", { outcomeLog: outcomesA });
+  const second = makePending("approval:2", { outcomeLog: outcomesB });
+  const loaded = loadPlugin(window, makeUiSession([first, second]));
+  press(loaded);
+  check(
+    "23 only the visible panel's request is answered",
+    outcomesA.length === 0 && JSON.stringify(outcomesB) === '["allowed-once"]',
+    `A=${JSON.stringify(outcomesA)} B=${JSON.stringify(outcomesB)}`,
+  );
+}
+
+/* 24. contenteditable target/focus is typing, not approval. */
+{
+  const window = makeWindow();
+  buildApprovalPanel(window.document);
+  const editor = new Element("div", window.document);
+  editor.setAttribute("contenteditable", "true");
+  editor.isContentEditable = true;
+  window.document.body.appendChild(editor);
+  editor.focus();
+  const outcomes = [];
+  const pending = makePending("approval:1", { outcomeLog: outcomes });
+  const loaded = loadPlugin(window, makeUiSession([pending]));
+  const event = press(loaded, { target: editor });
+  check("24 contenteditable Space is not intercepted", event.defaultPrevented === false && outcomes.length === 0);
+}
+
+/* 25. A throwing answer must not fall back to clicking a button. */
+{
+  const window = makeWindow();
+  const panel = buildApprovalPanel(window.document);
+  const pending = {
+    kind: "approval",
+    key: "approval:1",
+    answerable: true,
+    answer() {
+      throw new Error("already settled");
+    },
+  };
+  const loaded = loadPlugin(window, makeUiSession([pending]));
+  const event = press(loaded);
+  check(
+    "25 failed semantic answer does not click a fallback button",
+    event.defaultPrevented === false && panel.buttons.every((b) => b.__clicks === 0),
+    `clicks=[${panel.buttons.map((b) => b.__clicks)}]`,
+  );
+}
+
+/* 26. A rejected answer promise is contained (no unhandled rejection, no click). */
+{
+  const window = makeWindow();
+  const panel = buildApprovalPanel(window.document);
+  const pending = {
+    kind: "approval",
+    key: "approval:1",
+    answerable: true,
+    answer() {
+      return Promise.reject(new Error("host refused"));
+    },
+  };
+  const loaded = loadPlugin(window, makeUiSession([pending]));
+  const event = press(loaded);
+  check(
+    "26 rejected answer is contained and does not click a button",
+    event.defaultPrevented === true && panel.buttons.every((b) => b.__clicks === 0),
+    `clicks=[${panel.buttons.map((b) => b.__clicks)}]`,
+  );
+}
+
+/* 27. No uiSession service: plugin disables itself instead of guessing. */
+{
+  const window = makeWindow();
+  const panel = buildApprovalPanel(window.document);
+  const loaded = loadPlugin(window);
+  const event = press(loaded);
+  check(
+    "27 missing uiSession service disables Space approval",
+    event.defaultPrevented === false && panel.buttons.every((b) => b.__clicks === 0),
+  );
+}
+
+/* 28. Focused link keeps native Space activation. */
+{
+  const window = makeWindow();
+  buildApprovalPanel(window.document);
+  const link = new Element("a", window.document);
+  link.setAttribute("href", "#somewhere");
+  window.document.body.appendChild(link);
+  link.focus();
+  const outcomes = [];
+  const pending = makePending("approval:1", { outcomeLog: outcomes });
+  const loaded = loadPlugin(window, makeUiSession([pending]));
+  const event = press(loaded, { target: link });
+  check("28 focused link keeps native Space", event.defaultPrevented === false && outcomes.length === 0);
 }
 
 /* -------------------------------- summary -------------------------------- */

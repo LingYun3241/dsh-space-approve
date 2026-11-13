@@ -110,7 +110,10 @@ window.__ModuleLoader__.load({
           if (result && typeof result.catch === "function") result.catch((error) => log("answer rejected", error));
           return true;
         } catch (error) {
+          // Never fall back to clicking when a semantic answer exists but failed:
+          // that risks double-answering a request the host may already have settled.
           log("answer threw", error);
+          return false;
         }
       }
       return clickAllowOnce(panel);

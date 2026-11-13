@@ -68,7 +68,7 @@ localStorage.setItem("dsh-space-approve:debug", "1");
 node test/space-approve.test.mjs
 ```
 
-测试自带一个最小 DOM harness，直接加载本包的 `client.js`，覆盖：可见待批请求、文本框、聚焦按钮、IME、重复键、修饰键、多面板歧义、隐藏面板、三按钮「始终允许」卡片、卸载清理。
+测试自带一个最小 DOM harness，直接加载本包的 `client.js`，共 **33 项断言**，覆盖：可见待批请求、文本框/contenteditable、聚焦按钮/链接、IME、重复键、修饰键、双次按键、多会话只答可见面板、多面板歧义、隐藏/inert 面板、三按钮「始终允许」卡片、`answer()` 抛错/拒绝、缺少 `uiSession` 服务时自动禁用、卸载清理。
 
 ## 卸载
 
