@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.1.4 — 2026-11-13
+
+- **修复：插件整体不加载**。1.1.1 起用 PowerShell 改写 `package.json` 时写入了 UTF-8 BOM，
+  宿主 `JSON.parse` 直接失败，bundle 行加载失败 → 没有任何监听器，空格和 Esc 一起失灵，
+  控制台也没有插件日志。已去掉 BOM；并新增 8 项 manifest 卫生检查（BOM / JSON 可解析 /
+  `dsh.bundle` / `dsh.client` / patch 文件存在）防止复发。
+- 测试总数 57 项。
+
+## 1.1.3 — 2026-11-13
+
+- 启动日志与按键决策日志改为 `warn` 级别：Info 级别会被 DevTools 的级别过滤器隐藏
+  （控制台显示 “2 hidden”），看起来像插件完全静默。
+
+## 1.1.2 — 2026-11-13
+
+- 把静默失败改成可诊断：启动日志（版本 / 输入路径 / Esc 开关）、每次空格/Esc 的决策日志、
+  以及原因码（`no-panel` / `multi-panel:<n>` / `no-pending:<key>` / `other-modal` /
+  `focus-in-card-control` / `answer-failed` / `answered`），同一份数据也留在
+  `window.__dshSpaceApprove`。
+
 ## 1.1.1 — 2026-11-13
 
 - **修复：空格在“切回会话后”失灵**。原因是我们改到宿主 `window` 冒泡阶段后排在了焦点控件自己的

@@ -8,7 +8,7 @@
  *
  * Run:  node test/space-approve.test.mjs
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import vm from "node:vm";
@@ -795,6 +795,30 @@ console.log("=".repeat(78));
   // normalized input for the same press must not answer a second time.
   shortcuts.emit(fixedInput());
   check("C2 a replayed host input does not answer twice", outcomesOf(pending).length === 1, JSON.stringify(outcomesOf(pending)));
+}
+
+/* C3 — manifest hygiene: a UTF-8 BOM breaks host JSON.parse and kills the plugin */
+{
+  const raw = readFileSync(join(HERE, "..", "package.json"));
+  const hasBom = raw.length >= 3 && raw[0] === 0xef && raw[1] === 0xbb && raw[2] === 0xbf;
+  check("C3 package.json has no UTF-8 BOM", hasBom === false);
+  let manifest = null;
+  try {
+    manifest = JSON.parse(raw.toString("utf8").replace(/^\uFEFF/, ""));
+  } catch (error) {
+    check("C3 package.json parses as JSON", false, String(error));
+  }
+  if (manifest) {
+    check("C3 package.json parses as JSON", true);
+    check("C3 declares a dsh bundle patch", Boolean(manifest.dsh && manifest.dsh.bundle && manifest.dsh.bundle.patch));
+    check("C3 declares a web client half", Boolean(manifest.dsh && manifest.dsh.client));
+    check("C3 batch patch file exists", existsSync(join(HERE, "..", "cordis.patch.yml")));
+  }
+  for (const file of ["client.js", "index.js", "cordis.patch.yml"]) {
+    const bytes = readFileSync(join(HERE, "..", file));
+    const bom = bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf;
+    check(`C3 ${file} has no UTF-8 BOM`, bom === false);
+  }
 }
 
 /* -------------------------------- summary -------------------------------- */
