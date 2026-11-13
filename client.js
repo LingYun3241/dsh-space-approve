@@ -215,7 +215,7 @@ window.__ModuleLoader__.load({
           if (!isElement(event.target) || isEditable(event.target) || editingSomewhere()) return;
           const result = run(action);
           push(diag.decisions, { via: "dom", action, ...result });
-          console.info("[space-approve]", viaLabel(action), "→", result.reason);
+          console.warn("[space-approve]", viaLabel(action), "→", result.reason);
           if (!result.acted) return;
           event.preventDefault();
           if (typeof event.stopPropagation === "function") event.stopPropagation();
@@ -249,7 +249,7 @@ window.__ModuleLoader__.load({
           if (editingSomewhere()) return;
           const result = run(action);
           push(diag.decisions, { via: "shortcuts", action, ...result });
-          console.info("[space-approve] shortcuts", viaLabel(action), "→", result.reason);
+          console.warn("[space-approve] shortcuts", viaLabel(action), "→", result.reason);
           if (!result.acted) return;
           if (typeof input.consume === "function") input.consume();
         } catch (error) {
@@ -322,7 +322,7 @@ window.__ModuleLoader__.load({
         }
         const boot = { version: "1.1.2", mode, escape: escapeEnabled, at: Date.now() };
         if (window.__dshSpaceApprove) window.__dshSpaceApprove.boot = boot;
-        console.info("[space-approve] ready", boot);
+        console.warn("[space-approve] ready", boot);
       },
     };
   },
