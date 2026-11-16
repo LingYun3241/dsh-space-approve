@@ -66,7 +66,7 @@
   处理器之后，对方对空格调用 `preventDefault()` 会让宿主把按键标记为已处理，插件按设计跳过。
   现在恢复 `document` **捕获阶段**监听为主路径（抢在控件之前），官方 `observeFixedInput` 作为兜底；
   应答后 `stopPropagation()`，两条路径不会重复应答。
-- 新增诊断：最近 20 次按键事实与决策记录在 `window.__dshSpaceApprove`（DevTools 可读）。
+- 新增诊断：最近 30 次按键事实与决策记录在 `window.__dshSpaceApprove`（DevTools 可读）。
 - 测试 49 项（新增捕获阶段优先级、双路径不重复应答）。
 
 ## 1.1.0 — 2026-11-13
