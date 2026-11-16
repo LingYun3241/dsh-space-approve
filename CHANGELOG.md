@@ -1,5 +1,45 @@
 # Changelog
 
+## 1.1.5 — 2026-11-16
+
+安全修复版（对抗性审查后的整改）。无 API/安装方式变化。
+
+- **P0 修复：打字中的空格会误批特权命令**。审批卡接管 `conversation.composer` 时，官方渲染器把原
+  composer（含正在聚焦的编辑器）包进 `display:none`，浏览器让编辑器失焦、`document.activeElement`
+  回落到 `<body>`，两个“是否在打字”的守卫同时失效 → 空格 = `allowed-once`。
+  现在为每块卡片记录**首次可见时间**（`MutationObserver`，卡片出现在任意时刻都准确，不是“第一次按键才记”），
+  距今 `< cooldownMs`（默认 300，可用 `config.cooldownMs` 或 `localStorage["dsh-space-approve:cooldownMs"]` 调整）
+  时返回原因码 `warming:<key>`，**不消费按键**，再按一次即可；Esc 不受冷却期影响。
+- **P1 修复：`MODAL` 与宿主 `modalSelector` 不一致**。选择器改为
+  `[role="dialog"][aria-modal="true"], [role="menu"]`，取**最上层**可见弹层（不是文档序第一个），
+  并过滤不可见的挂载节点。右键菜单/下拉菜单打开时不再批准，也不会再被 `display:none` 的弹层永久压住。
+- **P1 修复：DOM 主路径缺少“组字结束”守卫**。照抄官方卡片的 `composing` / `compositionEnded`
+  状态机（`compositionstart` / `compositionend` / `keyup` 捕获监听），WebKit 上“空格选词”不再可能变成批准。
+- **P2 修复：`config.escape:false` 送不到 client 半身**。已确认宿主创建 bundle entry 只传 `{ name }`，
+  `apply(ctx, config)` 的 `config` 恒为 `undefined`。改用页面可读的 `localStorage`
+  （`escape` / `cooldownMs` / `debug`）；README 的配置章节按实际行为重写。
+- **P2 修复：`shortcuts` 启动竞态**。改用官方写法 `ctx.inject(["shortcuts"], scope => scope.effect(...))`
+  等待服务就绪；老宿主没有 `ctx.inject` 时退回 `ctx.get` 并在缺失时打一条一次性 warning。
+- **P2 修复：删除按位置点按钮的兜底**（`clickDecision`/`decisionButtons`）。没有 `answer()` 时直接
+  `answer-failed`，兑现“绝不点按钮、绝不持久授权”的承诺。
+- **P2 修复：`isVisible` 放宽**。去掉 `checkOpacity`（淡入动画期间不再误判 `no-panel`），保留
+  display/visibility/零尺寸/`[inert]`；原因码细分 `no-panel` / `no-panel:hidden`。
+- **P2 修复：分屏/动画重叠静默失效**。多块可见卡片时先按“key 是否真有匹配的待批请求”筛选：
+  只有一块匹配就回答它（残留卡片不再挡住真的待批卡），两块都匹配才 `multi-panel:<n>` 放弃。
+- **P2 修复：版本号漂移**。`client.js` 的 `boot.version` 改为单一 `VERSION` 常量并与
+  `package.json` 对齐，测试新增版本一致性断言，README 的断言数量也由测试反向校验。
+- **P2 修复：卸载清理**。disposer 里删除 `window.__dshSpaceApprove`，不再跨热更新泄漏。
+- **P3**：非应答按键不再无条件 `console.warn`（改为仅应答时 warn、调试开关下 info）；诊断 `inputs`
+  只记录通过输入守卫的候选按键；`[role="combobox"]` 只保留在 EDITABLE 一处；兜底路径补
+  `context.target === null` 守卫；README 注明 Shadow DOM / `isTrusted` 的边界。
+- **测试重写：57 → 149 项断言**。新 harness 具备真实传播模型（capture 顺序、`stopPropagation`
+  生效、记录 capture 标志）、接到同一条派发链上的宿主 `shortcuts`（window 冒泡）、可控时钟、
+  `MutationObserver` 与可延迟的 `ctx.inject`。修复了原 A12（inert 实际走 multi-panel）、C1、C2 三条假阳性。
+- **新增变异检查 `test/mutation.mjs`**：37 个针对性变异（审查报告的 26 个 + 冷却期/传播/监控等），
+  当前 **37/37 = 100% 被杀死**（整改前为 9/26 ≈ 35%）。
+- **新增 `scripts/proof-composer-takeover.mjs`**：用 `git show v1.1.4:client.js` 跑修复前代码作对照，
+  修复前空格直接 `allowed-once`，修复后输出 `warming:approval:7`，300ms 后再按才是 `allowed-once`。
+
 ## 1.1.4 — 2026-11-13
 
 - **修复：插件整体不加载**。1.1.1 起用 PowerShell 改写 `package.json` 时写入了 UTF-8 BOM，
