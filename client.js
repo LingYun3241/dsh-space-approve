@@ -25,15 +25,22 @@ window.__ModuleLoader__.load({
      *    holding focus, IME composition (including the WebKit "composition just
      *    ended" keydown), key repeat, chorded keys, unrelated modals (dialogs and
      *    menus), and decision buttons *inside* the card all pass through.
-     * 4. A card that just appeared is warming up: for `cooldownMs` (default 300)
-     *    after its key is first seen, Space is ignored instead of consumed. The
-     *    official renderer hides the composer (containing the focused editor) when
-     *    the approval card takes over the slot, so focus falls back to <body> and
-     *    a Space typed out of habit would otherwise approve a privileged call.
+     * 4. The composer takeover must not turn typing into an approval. When the
+     *    official renderer hides the composer (containing the focused editor),
+     *    focus falls back to <body>; the editor that last held focus is still in
+     *    the document but no longer visible, and nothing has re-engaged the UI
+     *    since. Space is then refused with `editor-hidden`: it never answers, it
+     *    keeps the key from scrolling, and it stays on the propagation path so the
+     *    fallback path cannot answer either. The test is re-evaluated at every
+     *    keydown and never expires on a timer, so a click or a focus change
+     *    re-enables Space immediately.
+     * 5. The optional cooling-off window (`cooldownMs`, 0 by default) is a second,
+     *    strictly weaker layer, only active when explicitly enabled through
+     *    `localStorage`; it is not the defence against typing inertia.
      */
 
     /** Single source of truth for the diagnostic boot line; the test suite keeps it in sync with package.json. */
-    const VERSION = "1.1.5";
+    const VERSION = "1.1.6";
 
     const PANEL = "[data-approval-key]";
     const EDITABLE =
@@ -45,10 +52,18 @@ window.__ModuleLoader__.load({
 
     /** Client-visible settings: `localStorage["dsh-space-approve:<name>"]` (`debug`, `escape`, `cooldownMs`). */
     const STORAGE_PREFIX = "dsh-space-approve:";
-    const DEFAULT_COOLDOWN_MS = 300;
+    /**
+     * The cooling-off window used to be the P0 defence and defaulted to 300ms; it only
+     * delayed the misfire by one Space (measured: +300ms still approved) and swallowed
+     * the first intentional press. The focus-loss guard replaced it, so the window is
+     * off by default and exists only as an opt-in second layer.
+     */
+    const DEFAULT_COOLDOWN_MS = 0;
     const MAX_DIAG = 30;
     /** Bound for the appearance-time map; older keys are pruned first. */
     const MAX_SEEN_KEYS = 64;
+    /** Bound for the "press ignored" warnings; one per key, not per keystroke. */
+    const MAX_WARNED = 32;
 
     const readSetting = (name) => {
       try {
@@ -177,15 +192,7 @@ window.__ModuleLoader__.load({
       return null;
     }
 
-    function createHandler({ uiSession, escapeEnabled, cooldownMs }) {
-      /** Diagnostics on `window.__dshSpaceApprove`; also readable from DevTools. */
-      const diag = (() => {
-        const existing = window.__dshSpaceApprove;
-        if (existing && Array.isArray(existing.inputs) && Array.isArray(existing.decisions)) return existing;
-        const fresh = { boot: null, inputs: [], decisions: [] };
-        window.__dshSpaceApprove = fresh;
-        return fresh;
-      })();
+    function createHandler({ uiSession, escapeEnabled, cooldownMs, diag }) {
       const push = (bucket, entry) => {
         try {
           bucket.push({ t: Date.now(), ...entry });
@@ -193,6 +200,16 @@ window.__ModuleLoader__.load({
         } catch {
           /* diagnostics must never break the handler */
         }
+      };
+
+      /**
+       * Record a key the guards swallowed, so "why did nothing happen" is answerable
+       * from `window.__dshSpaceApprove.inputs`. One physical key gets exactly one
+       * record: the primary path records after it decides, and the fallback path stays
+       * silent when the primary path already prevented the default.
+       */
+      const skipInput = (via, source, skip) => {
+        push(diag.inputs, { via, code: source && source.code, key: source && source.key, skip });
       };
 
       /** When each approval key first became visible; the P0 cooling-off window reads this. */
@@ -218,19 +235,25 @@ window.__ModuleLoader__.load({
           seenAt.delete(oldest.value);
         }
       };
+      /**
+       * Re-mounting a card for the same pending key must keep its original timestamp:
+       * only a pending request that is really gone resets the appearance clock.
+       */
+      const dropSeen = (panel) => {
+        const key = panelKey(panel);
+        if (key === null || key === undefined) return;
+        if (pendingFor(uiSession, key) !== null) return;
+        seenAt.delete(key);
+      };
       const forget = (root) => {
         if (!root) return;
         try {
           if (isElement(root) && typeof root.matches === "function" && root.matches(PANEL)) {
-            const key = panelKey(root);
-            if (key !== null) seenAt.delete(key);
+            dropSeen(root);
             return;
           }
           if (typeof root.querySelectorAll !== "function") return;
-          for (const panel of root.querySelectorAll(PANEL)) {
-            const key = panelKey(panel);
-            if (key !== null) seenAt.delete(key);
-          }
+          for (const panel of root.querySelectorAll(PANEL)) dropSeen(panel);
         } catch {
           /* ignore */
         }
@@ -242,12 +265,23 @@ window.__ModuleLoader__.load({
         try {
           const observer = new MutationObserver((records) => {
             for (const record of records) {
+              if (record.type === "attributes") {
+                // React can set `data-approval-key` after the node is inserted; without
+                // this the first press is eaten by the (optional) cooling-off window.
+                stamp(record.target);
+                continue;
+              }
               for (const node of record.addedNodes || []) stamp(node);
               for (const node of record.removedNodes || []) forget(node);
             }
           });
           const root = document.documentElement || document;
-          observer.observe(root, { childList: true, subtree: true });
+          observer.observe(root, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ["data-approval-key"],
+          });
           return observer;
         } catch (error) {
           warn("panel observer unavailable", error);
@@ -299,57 +333,208 @@ window.__ModuleLoader__.load({
         );
       };
 
-      /** @returns {{acted: boolean, reason: string}} */
+      /** @returns {{acted: boolean, reason: string, key?: string}} */
       const run = (action) => {
         const target = resolveTarget();
-        if (target.reason !== undefined) return { acted: false, reason: target.reason };
+        if (target.reason !== undefined) {
+          // The pending request is really gone: the guard has nothing left to protect.
+          if (String(target.reason).startsWith("no-pending:")) {
+            lastEditable = null;
+            engaged = false;
+          }
+          return { acted: false, reason: target.reason };
+        }
         if (activatableInsideCard(target.panel)) return { acted: false, reason: "focus-in-card-control" };
-        if (action === "allow") {
+        if (floatingLayerOfCard(target.panel)) return { acted: false, reason: "focus-in-card-control" };
+        if (action === "allow" && hiddenEditorLost()) {
+          return { acted: false, reason: "editor-hidden", key: target.pending.key };
+        }
+        if (action === "allow" && cooldownMs > 0) {
           const key = target.pending.key;
           const appearedAt = seenAt.get(key);
           if (typeof appearedAt !== "number") {
-            // The observer missed the insertion (or it predates the plugin): start
-            // the clock now and refuse this press, which is the safe direction.
+            // The observer missed the insertion (or it predates the plugin): start the
+            // clock now and refuse this press, which is the safe direction. This only
+            // applies while the optional cooling-off window is enabled.
             seenAt.set(key, Date.now());
-            return { acted: false, reason: "warming:" + key };
+            return { acted: false, reason: "warming:" + key, key };
           }
-          if (Date.now() - appearedAt < cooldownMs) return { acted: false, reason: "warming:" + key };
+          if (Date.now() - appearedAt < cooldownMs) return { acted: false, reason: "warming:" + key, key };
         }
         if (!decide(target.pending, action)) return { acted: false, reason: "answer-failed" };
         log(action === "reject" ? "rejected with Escape" : "approved once with Space", target.pending.key);
         return { acted: true, reason: "answered" };
       };
 
-      /** Only answered keys are noisy by default; every other outcome waits for the debug switch. */
+      /**
+       * Only answered keys are noisy by default. A refusal the user can perceive as
+       * "nothing happened" (`editor-hidden`, `warming:<key>`) gets exactly one warning
+       * per approval key, so the plugin never looks dead without a console trace.
+       */
+      const warned = new Set();
       const report = (via, action, result) => {
-        if (result.acted) warn(viaLabel(action), "→", result.reason);
-        else log(via, viaLabel(action), "→", result.reason);
+        if (result.acted) {
+          warn(viaLabel(action), "→", result.reason);
+          return;
+        }
+        const reason = String(result.reason || "");
+        const visible = reason === "editor-hidden" || reason.startsWith("warming:");
+        if (visible) {
+          const once = reason + "|" + String(result.key);
+          if (!warned.has(once) && warned.size < MAX_WARNED) {
+            warned.add(once);
+            warn(
+              viaLabel(action),
+              "ignored —",
+              reason === "editor-hidden"
+                ? "the composer hid the editor you were typing in; click anywhere (or press Escape) to answer"
+                : "the approval card just appeared; press again",
+            );
+            return;
+          }
+        }
+        log(via, viaLabel(action), "→", result.reason);
+      };
+
+      /**
+       * rc.3's `ApprovalWarning` popover is a portalled, non-modal dialog opened from a
+       * button inside the card. It does not match `MODAL` (no `aria-modal`), so a Space
+       * or Escape pressed while reading it would answer the approval; treat a floating
+       * layer anchored on an in-card `aria-controls` trigger as an in-card control.
+       */
+      const floatingLayerOfCard = (panel) => {
+        const active = document.activeElement;
+        if (!isElement(active) || active === document.body) return false;
+        const layer = closestOf(active, '[role="dialog"]');
+        if (!layer || layer.getAttribute("aria-modal") === "true") return false;
+        if (panel.contains(layer)) return false;
+        const id = layer.getAttribute("id");
+        if (!id) return false;
+        for (const trigger of panel.querySelectorAll("[aria-controls]")) {
+          if (trigger.getAttribute("aria-controls") === id) return true;
+        }
+        return false;
+      };
+
+      /**
+       * P0 guard. The composer takeover hides the focused editor (the slot fallback
+       * becomes `display:none`) and the browser drops focus to <body>, so a Space typed
+       * out of habit would approve a privileged call. The test is dynamic and time-free:
+       * the editor that last held focus is still in the document but is no longer
+       * visible, and nothing has re-engaged the UI since. It is re-evaluated on every
+       * keydown, so a click or a focus change re-enables Space immediately.
+       */
+      let lastEditable = null;
+      let engaged = false;
+      /** contenteditable keydowns arrive from inner nodes: normalize to the editable root. */
+      const normalizeEditable = (node) => closestOf(node, EDITABLE) || node;
+      const rememberEditor = (node) => {
+        lastEditable = normalizeEditable(node);
+        engaged = false;
+      };
+      const hiddenEditorLost = () =>
+        !engaged &&
+        Boolean(lastEditable) &&
+        document.activeElement !== lastEditable &&
+        !isVisible(lastEditable);
+      const onFocusIn = (event) => {
+        const target = event && event.target;
+        if (!isElement(target)) return;
+        if (isEditable(target)) {
+          rememberEditor(target);
+          return;
+        }
+        // Focus settling on <body>/<html> is the symptom, not a re-engagement.
+        if (target === document.body || target === document.documentElement) return;
+        // Autofocus inside the approval card must not unlock the guard.
+        if (closestOf(target, PANEL) !== null) return;
+        engaged = true;
+      };
+      const onPointerDown = (event) => {
+        const target = event && event.target;
+        // Clicking inside the editor (caret move, selection) is still typing.
+        if (isEditable(target)) {
+          rememberEditor(target);
+          return;
+        }
+        engaged = true;
       };
 
       /** Composition state mirrors the official card (WebKit reports isComposing late). */
       let composing = false;
       let compositionEnded = false;
+      const resetComposition = () => {
+        composing = false;
+        compositionEnded = false;
+      };
+      /**
+       * The host's own composition tracker also resets on window blur; without the same
+       * reset one dangling `compositionstart` (for example when the composer was hidden
+       * mid-composition) would silence Space and Escape forever.
+       */
+      const onWindowBlur = () => resetComposition();
+      const onVisibilityChange = () => {
+        if (document.visibilityState === "hidden") resetComposition();
+      };
 
       /** Primary path: capture phase, before control-level handlers. */
       const onDomKeyDown = (event) => {
         try {
+          // Any keydown that lands in an editor means the user is still typing: reset the
+          // "engaged the UI" flag silently, without writing a record per keystroke.
+          if (isEditable(event.target)) rememberEditor(event.target);
           const action = actionOfDom(event);
           if (action === null) return;
-          if (event.defaultPrevented || event.repeat || event.isComposing || event.keyCode === 229) return;
-          if (composing || compositionEnded) return;
+          // Our own preventDefault (editor-hidden below) must not be recorded twice.
+          if (event.defaultPrevented) return;
+          if (event.repeat) {
+            skipInput("dom", event, "repeat");
+            return;
+          }
+          if (event.isComposing || event.keyCode === 229) {
+            skipInput("dom", event, "ime");
+            return;
+          }
+          if (isEditable(event.target)) {
+            skipInput("dom", event, "editable-target");
+            return;
+          }
+          if (composing) {
+            skipInput("dom", event, "composing");
+            return;
+          }
+          if (compositionEnded) {
+            skipInput("dom", event, "composition-ended");
+            return;
+          }
           if (!escapeEnabled && action === "reject") return;
-          if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
-          if (!isElement(event.target) || isEditable(event.target) || editingSomewhere()) return;
+          if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) {
+            skipInput("dom", event, "modifier");
+            return;
+          }
+          if (!isElement(event.target)) return;
+          if (editingSomewhere()) {
+            rememberEditor(document.activeElement);
+            skipInput("dom", event, "editor-focused");
+            return;
+          }
+          const result = run(action);
+          // One record per physical key; `skip` marks the press the P0 guard refused.
           push(diag.inputs, {
             via: "dom",
             code: event.code,
             key: event.key,
             mods: [event.ctrlKey, event.altKey, event.shiftKey, event.metaKey].filter(Boolean).join("+") || "-",
+            ...(result.reason === "editor-hidden" ? { skip: "editor-hidden" } : {}),
           });
-          const result = run(action);
           push(diag.decisions, { via: "dom", action, ...result });
           report("dom", action, result);
-          if (!result.acted) return;
+          if (!result.acted) {
+            // Focus is on <body> here, so Space would scroll the page; swallow that while
+            // still letting the event propagate (the fallback path checks the flag).
+            if (result.reason === "editor-hidden") event.preventDefault();
+            return;
+          }
           event.preventDefault();
           if (typeof event.stopPropagation === "function") event.stopPropagation();
         } catch (error) {
@@ -377,22 +562,48 @@ window.__ModuleLoader__.load({
           const context = input.context;
           const action = actionOf(gesture);
           if (action === null) return;
+          // Silent: the primary path already answered or refused and called preventDefault.
+          if (!gesture || gesture.defaultPrevented) return;
           if (!escapeEnabled && action === "reject") return;
-          if (!gesture || gesture.defaultPrevented || gesture.composing || gesture.repeat) return;
-          if (gesture.control || gesture.alt || gesture.shift || gesture.meta) return;
-          if (!context || context.region !== "page") return;
-          if (context.modal !== null && context.modal !== undefined) return;
+          if (gesture.composing) {
+            skipInput("shortcuts", gesture, "ime");
+            return;
+          }
+          if (gesture.repeat) {
+            skipInput("shortcuts", gesture, "repeat");
+            return;
+          }
+          if (gesture.control || gesture.alt || gesture.shift || gesture.meta) {
+            skipInput("shortcuts", gesture, "modifier");
+            return;
+          }
+          if (!context || context.region !== "page") {
+            skipInput("shortcuts", gesture, "not-page");
+            return;
+          }
+          if (context.modal !== null && context.modal !== undefined) {
+            skipInput("shortcuts", gesture, "modal");
+            return;
+          }
           // The host reports a null target when no element took the key; there is no
           // typing context to judge, and the DOM path already had its chance.
-          if (context.target === null || context.target === undefined) return;
-          if (editingSomewhere()) return;
+          if (context.target === null || context.target === undefined) {
+            skipInput("shortcuts", gesture, "no-target");
+            return;
+          }
+          if (editingSomewhere()) {
+            rememberEditor(document.activeElement);
+            skipInput("shortcuts", gesture, "editor-focused");
+            return;
+          }
+          const result = run(action);
           push(diag.inputs, {
             via: "shortcuts",
             code: gesture && gesture.code,
             region: context.region,
             modal: context.modal,
+            ...(result.reason === "editor-hidden" ? { skip: "editor-hidden" } : {}),
           });
-          const result = run(action);
           push(diag.decisions, { via: "shortcuts", action, ...result });
           report("shortcuts", action, result);
           if (!result.acted) return;
@@ -408,6 +619,10 @@ window.__ModuleLoader__.load({
         onCompositionEnd,
         onKeyUp,
         onFixedInput,
+        onFocusIn,
+        onPointerDown,
+        onWindowBlur,
+        onVisibilityChange,
         watchPanels,
         stamp,
         diag,
@@ -444,15 +659,41 @@ window.__ModuleLoader__.load({
     return {
       inject: ["uiSession"],
       apply(ctx, config) {
+        // One live instance per page: a duplicate apply (HMR, double mount) replaces the
+        // previous one instead of stacking listeners and stealing its diagnostics.
+        const previous = window.__dshSpaceApproveTeardown;
+        if (typeof previous === "function") {
+          try {
+            previous();
+          } catch (error) {
+            log("previous teardown failed", error);
+          }
+        }
+        const diag = { boot: null, inputs: [], decisions: [] };
+        window.__dshSpaceApprove = diag;
         const service = resolveUiSession(ctx);
         if (!service || !service.sessionStatus) {
           warn("uiSession service unavailable; approval hotkeys disabled");
-          window.__dshSpaceApprove = { boot: "no-uiSession", inputs: [], decisions: [] };
+          diag.boot = "no-uiSession";
           return;
         }
         const { escapeEnabled, cooldownMs } = resolveOptions(config);
-        const handler = createHandler({ uiSession: service, escapeEnabled, cooldownMs });
+        const handler = createHandler({ uiSession: service, escapeEnabled, cooldownMs, diag });
         const disposers = [];
+        let disposed = false;
+        const disposeAll = () => {
+          disposed = true;
+          for (const dispose of disposers.splice(0)) {
+            try {
+              dispose();
+            } catch (error) {
+              log("dispose failed", error);
+            }
+          }
+          if (window.__dshSpaceApprove === diag) delete window.__dshSpaceApprove;
+          if (window.__dshSpaceApproveTeardown === disposeAll) window.__dshSpaceApproveTeardown = undefined;
+        };
+        window.__dshSpaceApproveTeardown = disposeAll;
 
         document.addEventListener("keydown", handler.onDomKeyDown, true);
         disposers.push(() => document.removeEventListener("keydown", handler.onDomKeyDown, true));
@@ -462,13 +703,21 @@ window.__ModuleLoader__.load({
         disposers.push(() => document.removeEventListener("compositionend", handler.onCompositionEnd, true));
         document.addEventListener("keyup", handler.onKeyUp, true);
         disposers.push(() => document.removeEventListener("keyup", handler.onKeyUp, true));
+        document.addEventListener("focusin", handler.onFocusIn, true);
+        disposers.push(() => document.removeEventListener("focusin", handler.onFocusIn, true));
+        document.addEventListener("pointerdown", handler.onPointerDown, true);
+        disposers.push(() => document.removeEventListener("pointerdown", handler.onPointerDown, true));
+        document.addEventListener("visibilitychange", handler.onVisibilityChange, true);
+        disposers.push(() => document.removeEventListener("visibilitychange", handler.onVisibilityChange, true));
+        window.addEventListener("blur", handler.onWindowBlur);
+        disposers.push(() => window.removeEventListener("blur", handler.onWindowBlur));
 
         handler.stamp(document);
         const observer = handler.watchPanels();
         if (observer) disposers.push(() => observer.disconnect());
 
         const boot = { version: VERSION, mode: "dom", escape: escapeEnabled, cooldownMs, at: Date.now() };
-        handler.diag.boot = boot;
+        diag.boot = boot;
 
         const registerFixedInput = (shortcuts) => {
           if (!shortcuts || typeof shortcuts.observeFixedInput !== "function") return null;
@@ -488,6 +737,8 @@ window.__ModuleLoader__.load({
           try {
             ctx.inject(["shortcuts"], (scope) => {
               const attach = () => {
+                // The instance was disposed while the service was still coming up.
+                if (disposed) return () => {};
                 const off = registerFixedInput(scope && scope.shortcuts);
                 return () => {
                   if (typeof off === "function") off();
@@ -495,7 +746,10 @@ window.__ModuleLoader__.load({
               };
               if (scope && typeof scope.effect === "function") {
                 try {
-                  scope.effect(attach, "dsh-space-approve: fixed input");
+                  // Keep the disposer: a duplicate apply must be able to detach this
+                  // instance's fixed-input listener too, not only its DOM listeners.
+                  const dispose = scope.effect(attach, "dsh-space-approve: fixed input");
+                  if (typeof dispose === "function") disposers.push(dispose);
                   return;
                 } catch (error) {
                   warn("shortcuts effect failed", error);
@@ -515,21 +769,7 @@ window.__ModuleLoader__.load({
         }
 
         if (typeof ctx.effect === "function") {
-          ctx.effect(
-            () => () => {
-              for (const dispose of disposers) {
-                try {
-                  dispose();
-                } catch (error) {
-                  log("dispose failed", error);
-                }
-              }
-              if (handler.diag && window.__dshSpaceApprove === handler.diag) {
-                delete window.__dshSpaceApprove;
-              }
-            },
-            "dsh-space-approve: Space approves once, Escape rejects",
-          );
+          ctx.effect(() => disposeAll, "dsh-space-approve: Space approves once, Escape rejects");
         }
         warn("[space-approve] ready", boot);
       },
