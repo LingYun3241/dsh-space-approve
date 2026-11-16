@@ -1,6 +1,63 @@
 # Changelog
 
+## 1.1.6 — 2026-11-16
+
+安全修复版：把 P0（打字惯性误批）的判据从"时间窗"换成"确定性复查"，并修 1.1.5 引入的静默失效路径。
+无 API / 安装方式变化。
+
+- **P0 真修复（替换 1.1.5 的 300ms 缓解）**。1.1.5 的 300ms 冷却只挡下第一记空格：实测卡片接管
+  composer 后 `+300ms` 的下一记空格就批准（`scripts/proof-composer-takeover.mjs` 的
+  `+300ms:answered` 一步自证）。1.1.6 改为**按键时动态复查**：记录最近获得焦点的可编辑根节点，
+  按键时若"它仍在文档里、`activeElement` 已离开它、且它已不可见（`display:none`/`inert`/零尺寸…）"，
+  且用户没有重新接管 UI，则 Space 返回 `editor-hidden`：**不批准**、`preventDefault()`（焦点在
+  `<body>`，防滚动）、**不** `stopPropagation()`。判据不依赖 `focusout` 事件、不依赖计时器；
+  点任意位置、聚焦卡片外控件、或重新点回编辑器即恢复。
+- **冷却期降级为可选项，默认关闭**（`DEFAULT_COOLDOWN_MS = 0`）。`warming:<key>` 只在
+  `localStorage["dsh-space-approve:cooldownMs"] > 0` 时出现；同时修掉"无时间戳卡片在
+  `cooldownMs=0` 时仍被懒记录拒绝"的分支（否则主卖点的第一按会被吃）。
+- **P1 落单组字自愈**：`window.blur` 与 `visibilitychange === "hidden"` 复位
+  `composing`/`compositionEnded`（宿主自己的 `observeComposition` 也有这两个复位点）。此前一次
+  落单的 `compositionstart` 会让 Space 和 Esc 永久失效且诊断零留痕。
+- **P1 冷却被重置**：`MutationObserver` 增加
+  `attributes: true, attributeFilter: ["data-approval-key"]`（属性后置也能记时）；
+  `forget()` 只在 pending 真的消失（`pendingFor()` 为 null）时才删时间戳，同一 key 的 DOM 重挂载
+  不再重置冷却。
+- **P1 按了没反应可查**：`editor-hidden` / `warming:<key>` 每个 key **只 warn 一次**（上限 32 条），
+  不再完全静默；README「安全边界」写明代价与恢复方式。
+- **诊断 `inputs` 重做**：记录每个被守卫挡下的 Space/Esc 及 `skip` 原因
+  （`repeat | ime | composing | composition-ended | modifier | editable-target | editor-focused |
+  editor-hidden | not-page | modal | no-target`），并挪到每次决策之后写入，**一个物理按键严格一条**；
+  已被其它处理器 `preventDefault` 的按键静默忽略，避免自污染（否则 editor-hidden 的 `preventDefault`
+  会在兜底路径留下第二条记录）。
+- **单实例 / 诊断归属**：每次 `apply` 新建 `{boot, inputs, decisions}`，不再复用页面全局对象；
+  apply 开头先拆掉上一个实例（`window.__dshSpaceApproveTeardown`），卸载只删自己的。重复 apply
+  不再叠加 `document` keydown / fixed-input 监听器，也不会删掉存活实例的诊断。
+- **P2-9 rc.3 `ApprovalWarning` 悬浮卡**：焦点在该 portal 的 `role="dialog"`（无 `aria-modal`）内、
+  且其 `id` 能被卡片内某个 `aria-controls` 触发元素引用时，视为卡片内控件（`focus-in-card-control`），
+  Space/Esc 交还原生。`MODAL` 选择器未变。
+- **引擎兼容**：`engines.dsh` 未变，但 README/发布说明写明它依赖宿主传
+  `{ includePrerelease: true }`（`dsh-app-boot/src/plugin-compatibility.ts:52`）；测试新增用同一语义
+  的断言（默认 semver 规则下 `0.2.2-rc.3` 不匹配）。
+- **测试：149 → 207 项断言**。新增：两秒打字惯性 0 批准、无 `focusout` 也拦住、点 composer 内部不算
+  接管、点空白后回编辑器继续打字、无编辑器焦点 80ms 首按立即批准、点空白后首按仍批准、Alt-Tab
+  视图（编辑器仍可见）不锁、编辑器被卸载仍锁、卡片内 autofocus 不解锁、`Esc` 在守卫下仍可拒绝、
+  组字 `blur`/`visibilitychange` 复位、属性后置记时、重挂载保留时间戳、无 observation 时 `cooldownMs=0`
+  首按放行、诊断 `inputs` 的 skip 原因与上限、重复 apply 单实例与诊断归属、悬浮卡交还原生、
+  engines 的 `includePrerelease` 语义与边界。修掉 1.1.5 的两条同义反复断言（`C3 bundle id`
+  实际没比包名、`B35 inputs 为空`在从不记录时恒真），`A12` 的 inert 用例改由 inert 单独驱动。
+- **变异检查 `test/mutation.mjs`**：选定 **59 个变异全部被杀（59/59）**；判定改为
+  `status !== 0 && failed > 0 && total >= baseline`，崩溃型运行单列 `SUSPECT`（不计杀）；
+  每个 `find` 必须**恰好命中一处**，否则脚本直接报错。该集合是手工挑选的，**不代表覆盖率**，
+  也不代表"每条守卫都有回归保护"。
+- **`scripts/proof-composer-takeover.mjs`**：改为 v1.1.4 / v1.1.5 / 1.1.6 三段对照，
+  前两段源码只从 `git tag` 读取（删除了"删掉冷却行重建"的回退，避免造出假结论），并新增
+  "无编辑器焦点 + 80ms 首按"的对照组。
+
 ## 1.1.5 — 2026-11-16
+
+> **勘误（1.1.6）**：本段把 300ms 冷却期称为"P0 修复"，与实测不符。它只挡下卡片出现后的第一记
+> 空格，`+300ms` 的下一记空格仍会批准（详见 1.1.6 段与 `scripts/proof-composer-takeover.mjs`）。
+> 1.1.5 应理解为**缓解**，真正的修复在 1.1.6。以下保留 1.1.5 的原始记录。
 
 安全修复版（对抗性审查后的整改）。无 API/安装方式变化。
 
@@ -36,7 +93,9 @@
   生效、记录 capture 标志）、接到同一条派发链上的宿主 `shortcuts`（window 冒泡）、可控时钟、
   `MutationObserver` 与可延迟的 `ctx.inject`。修复了原 A12（inert 实际走 multi-panel）、C1、C2 三条假阳性。
 - **新增变异检查 `test/mutation.mjs`**：37 个针对性变异（审查报告的 26 个 + 冷却期/传播/监控等），
-  当前 **37/37 = 100% 被杀死**（整改前为 9/26 ≈ 35%）。
+  当前 **37/37 被杀死**（整改前为 9/26 ≈ 35%）。
+  〔1.1.6 更正〕这是**手工挑选**的 37 个变异全部被杀，不是覆盖率，也不代表"每条守卫都有回归保护"；
+  1.1.6 已扩到 59 个，并把判定改为"失败数 > 0 且套件断言数不少于基线"。
 - **新增 `scripts/proof-composer-takeover.mjs`**：用 `git show v1.1.4:client.js` 跑修复前代码作对照，
   修复前空格直接 `allowed-once`，修复后输出 `warming:approval:7`，300ms 后再按才是 `allowed-once`。
 
